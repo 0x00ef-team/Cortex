@@ -2,8 +2,10 @@
 
 use std::path::Path;
 
+use crate::cuda::{CudaBuffer, CudaDevice};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
+use crate::Device;
 use std::sync::Arc;
 
 use crate::tensor::{dot, DequantPolicy};
@@ -24,6 +26,8 @@ pub struct LoadOptions {
     pub rope_style: Option<RopeStyle>,
     /// Number of threads used for large matrix-vector products (0 = auto).
     pub threads: usize,
+    /// Compute device. CUDA mode forces eager dequantization.
+    pub device: Device,
     /// Called with human-readable progress messages.
     pub progress: Option<Box<dyn FnMut(&str)>>,
 }
@@ -35,9 +39,26 @@ impl Default for LoadOptions {
             context: None,
             rope_style: None,
             threads: 0,
+            device: Device::Cpu,
             progress: None,
         }
     }
+}
+
+/// Weight matrices uploaded to VRAM.
+struct GpuLayer {
+    wq: CudaBuffer,
+    wk: CudaBuffer,
+    wv: CudaBuffer,
+    wo: CudaBuffer,
+    w_gate: CudaBuffer,
+    w_up: CudaBuffer,
+    w_down: CudaBuffer,
+}
+
+struct GpuWeights {
+    layers: Vec<GpuLayer>,
+    output: CudaBuffer,
 }
 
 /// A loaded model ready for autoregressive decoding.
@@ -48,6 +69,8 @@ pub struct Llama {
     cos: Vec<f32>,
     sin: Vec<f32>,
     pool: Arc<ThreadPool>,
+    gpu: Option<Arc<CudaDevice>>,
+    gpu_weights: Option<GpuWeights>,
 }
 
 impl Llama {
@@ -91,7 +114,12 @@ impl Llama {
                 config.n_ctx
             ));
         }
-        let weights = ModelWeights::load(&mut gguf, &config, options.dequant)?;
+        let policy = if options.device == Device::Cpu {
+            options.dequant
+        } else {
+            DequantPolicy::Eager
+        };
+        let weights = ModelWeights::load(&mut gguf, &config, policy)?;
         if let Some(p) = &mut options.progress {
             p("weights loaded");
         }
@@ -115,6 +143,43 @@ impl Llama {
             options.threads.max(1)
         };
 
+        let (gpu, gpu_weights) = match options.device {
+            Device::Cpu => (None, None),
+            Device::Cuda(idx) => {
+                if let Some(p) = &mut options.progress {
+                    p("initializing CUDA and compiling kernels");
+                }
+                let device = Arc::new(CudaDevice::new()?);
+                let _ = idx; // single-device support for now
+                let upload = |m: &crate::tensor::Matrix| -> Result<CudaBuffer> {
+                    let data = m
+                        .as_f32()
+                        .ok_or_else(|| Error::InvalidConfig("CUDA requires Eager weights".into()))?;
+                    device.upload(data)
+                };
+                let mut layers = Vec::with_capacity(config.n_layers);
+                for lw in &weights.layers {
+                    layers.push(GpuLayer {
+                        wq: upload(&lw.wq)?,
+                        wk: upload(&lw.wk)?,
+                        wv: upload(&lw.wv)?,
+                        wo: upload(&lw.wo)?,
+                        w_gate: upload(&lw.w_gate)?,
+                        w_up: upload(&lw.w_up)?,
+                        w_down: upload(&lw.w_down)?,
+                    });
+                }
+                let gw = GpuWeights {
+                    layers,
+                    output: upload(&weights.output)?,
+                };
+                if let Some(p) = &mut options.progress {
+                    p("weights uploaded to VRAM");
+                }
+                (Some(device), Some(gw))
+            }
+        };
+
         Ok(Self {
             config,
             weights,
@@ -122,6 +187,8 @@ impl Llama {
             cos,
             sin,
             pool: Arc::new(ThreadPool::new(threads)),
+            gpu,
+            gpu_weights,
         })
     }
 
@@ -185,9 +252,18 @@ impl Llama {
         let weights = &self.weights;
         let cache = &mut self.cache;
         let pool = Arc::clone(&self.pool);
+        let gpu = self.gpu.as_ref();
+        let gw = self.gpu_weights.as_ref();
         let scale = 1.0 / (hd as f32).sqrt();
-        let mv = |m: &crate::tensor::Matrix, x: &[f32], out: &mut [f32]| {
-            m.matvec_pool(x, out, &pool)
+        let mv = |buf: Option<&CudaBuffer>,
+                  m: &crate::tensor::Matrix,
+                  x: &[f32],
+                  out: &mut [f32]|
+         -> Result<()> {
+            match (gpu, buf) {
+                (Some(d), Some(b)) => d.matvec(b, x, out),
+                _ => m.matvec_pool(x, out, &pool),
+            }
         };
 
         for li in 0..cfg.n_layers {
@@ -196,9 +272,10 @@ impl Llama {
             // --- Multi-head attention with grouped-query support ---
             lw.attn_norm.row(0, &mut norm_buf)?;
             rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
-            mv(&lw.wq, &xb, &mut q)?;
-            mv(&lw.wk, &xb, &mut k)?;
-            mv(&lw.wv, &xb, &mut v)?;
+            let gl = gw.map(|g| &g.layers[li]);
+            mv(gl.map(|g| &g.wq), &lw.wq, &xb, &mut q)?;
+            mv(gl.map(|g| &g.wk), &lw.wk, &xb, &mut k)?;
+            mv(gl.map(|g| &g.wv), &lw.wv, &xb, &mut v)?;
             if let Some(b) = &lw.bq {
                 let mut bias = vec![0.0f32; q.len()];
                 b.row(0, &mut bias)?;
@@ -247,7 +324,7 @@ impl Llama {
                 }
             }
 
-            mv(&lw.wo, &attn, &mut o)?;
+            mv(gl.map(|g| &g.wo), &lw.wo, &attn, &mut o)?;
             for i in 0..cfg.n_embd {
                 x[i] += o[i];
             }
@@ -255,10 +332,10 @@ impl Llama {
             // --- SwiGLU feed-forward network ---
             lw.ffn_norm.row(0, &mut norm_buf)?;
             rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
-            mv(&lw.w_gate, &xb, &mut gate)?;
-            mv(&lw.w_up, &xb, &mut up)?;
+            mv(gl.map(|g| &g.w_gate), &lw.w_gate, &xb, &mut gate)?;
+            mv(gl.map(|g| &g.w_up), &lw.w_up, &xb, &mut up)?;
             swiglu(&gate, &up, &mut act)?;
-            mv(&lw.w_down, &act, &mut down)?;
+            mv(gl.map(|g| &g.w_down), &lw.w_down, &act, &mut down)?;
             for i in 0..cfg.n_embd {
                 x[i] += down[i];
             }
@@ -268,7 +345,7 @@ impl Llama {
         rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
 
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        mv(&weights.output, &xb, &mut logits)?;
+        mv(gw.map(|g| &g.output), &weights.output, &xb, &mut logits)?;
         Ok(logits)
     }
 }

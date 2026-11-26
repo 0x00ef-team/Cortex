@@ -22,12 +22,21 @@ fn main() -> Result<(), Error> {
     let mut cfg = GenerateConfig::default();
     let mut eager = false;
     let mut threads = 0usize;
+    let mut cuda = false;
     let mut i = 2;
     while i < args.len() {
         let flag = args[i].as_str();
         if flag == "--eager" {
             eager = true;
             i += 1;
+            continue;
+        }
+        if flag == "--device" {
+            if i + 1 >= args.len() {
+                return Err(Error::InvalidConfig("missing value for --device".into()));
+            }
+            cuda = args[i + 1] == "cuda";
+            i += 2;
             continue;
         }
         if flag == "--threads" {
@@ -60,6 +69,11 @@ fn main() -> Result<(), Error> {
             cortex::DequantPolicy::Lazy
         },
         threads,
+        device: if cuda {
+            cortex::Device::Cuda(0)
+        } else {
+            cortex::Device::Cpu
+        },
         progress: Some(Box::new(|msg| eprintln!("[cortex] {msg}"))),
         ..Default::default()
     };

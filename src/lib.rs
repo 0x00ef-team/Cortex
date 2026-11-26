@@ -20,8 +20,11 @@
 //! - Matrix-vector kernels, RMSNorm, RoPE, SwiGLU and softmax
 //! - Multi-head / grouped-query attention with a growing KV cache
 //! - BPE tokenization driven by GGUF vocabularies
+//! - Optional CUDA backend: JIT-compiled `matvec` kernel, weights in VRAM
 //! - Temperature, top-k, top-p, min-p and repetition-penalty sampling
 
+#[allow(unused_unsafe)]
+pub mod cuda;
 pub mod error;
 pub mod generate;
 pub mod gguf;
@@ -34,12 +37,23 @@ pub mod thread_pool;
 pub mod tokenizer;
 
 pub use error::{Error, Result};
+pub use cuda::CudaDevice;
 pub use generate::{generate, GenerateConfig, GenerateOutput};
 pub use model::{Llama, LoadOptions, ModelConfig, RopeStyle};
 pub use sampler::{Rng, Sampler};
 pub use tensor::DequantPolicy;
 pub use thread_pool::ThreadPool;
 pub use tokenizer::{PreTokenizer, Tokenizer};
+
+/// Compute device used for matrix-vector products.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    /// Portable CPU backend (default).
+    Cpu,
+    /// NVIDIA GPU with the given device index. Requires the CUDA driver and
+    /// CUDA Toolkit (for NVRTC). Weights are expanded to `f32` and uploaded.
+    Cuda(u32),
+}
 
 /// Convenience wrapper pairing a model with its tokenizer.
 pub struct Engine {

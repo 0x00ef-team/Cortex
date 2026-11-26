@@ -17,6 +17,7 @@ fn main() -> Result<()> {
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
     let mut threads = 0usize;
     let mut eager = false;
+    let mut cuda = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -28,6 +29,10 @@ fn main() -> Result<()> {
                 eager = true;
                 i += 1;
             }
+            "--device" => {
+                cuda = args.get(i + 1).map(|s| s.as_str()) == Some("cuda");
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -35,6 +40,11 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let options = LoadOptions {
         threads,
+        device: if cuda {
+            cortex::Device::Cuda(0)
+        } else {
+            cortex::Device::Cpu
+        },
         dequant: if eager {
             cortex::DequantPolicy::Eager
         } else {
