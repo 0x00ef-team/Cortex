@@ -93,6 +93,20 @@ cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
 
 See [README_CUDA.md](README_CUDA.md) for the CUDA backend design and benchmarks.
 
+### Weak PCs
+
+The default mode is already memory-friendly: GGUF is memory-mapped, weights stay
+quantized, and rows are dequantized on the fly. For small RAM use:
+
+```bash
+cargo run --release --example generate -- model-Q4_K_M.gguf "Hello" --low-mem --max 64
+```
+
+`--low-mem` forces lazy dequantization, limits the context to 512 tokens and
+uses 2 worker threads. Prefer Q4_K_M or smaller quantizations; avoid `--eager`
+(which expands all weights to f32). Model load needs almost no RAM: the OS
+reads mapped pages on demand.
+
 ### Performance
 
 `Qwen2.5-0.5B-Instruct-Q4_K_M`, RTX 2060, 8 CPU threads where applicable:
@@ -235,6 +249,20 @@ cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
 ```
 
 Дизайн и замеры CUDA-бэкенда: [README_CUDA.md](README_CUDA.md).
+
+### Слабые ПК
+
+Режим по умолчанию уже экономен: GGUF отображается в память, веса остаются
+квантованными, строки деквантуются по требованию. Для малого объёма RAM:
+
+```bash
+cargo run --release --example generate -- model-Q4_K_M.gguf "Hello" --low-mem --max 64
+```
+
+`--low-mem` включает lazy-деквантовку, ограничивает контекст 512 токенами и
+использует 2 потока. Берите кванты Q4_K_M и меньше; не используйте `--eager`
+(он расширяет все веса до f32). Загрузка модели почти не требует RAM — страницы
+читает ОС по запросу.
 
 ### Производительность
 

@@ -23,9 +23,15 @@ fn main() -> Result<(), Error> {
     let mut eager = false;
     let mut threads = 0usize;
     let mut cuda = false;
+    let mut low_mem = false;
     let mut i = 2;
     while i < args.len() {
         let flag = args[i].as_str();
+        if flag == "--low-mem" {
+            low_mem = true;
+            i += 1;
+            continue;
+        }
         if flag == "--eager" {
             eager = true;
             i += 1;
@@ -68,7 +74,8 @@ fn main() -> Result<(), Error> {
         } else {
             cortex::DequantPolicy::Lazy
         },
-        threads,
+        threads: if low_mem && threads == 0 { 2 } else { threads },
+        context: if low_mem { Some(512) } else { None },
         device: if cuda {
             cortex::Device::Cuda(0)
         } else {
