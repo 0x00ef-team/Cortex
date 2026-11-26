@@ -162,3 +162,25 @@ CUDA f32 matvec ~0.67 мс.
 
 `llama-bench` исключает префилл, `examples/bench` включает. Нагрузка на хост
 менялась между замерами, поэтому маленькие различия несущественны.
+
+### CUDA Graph / MMQ / GPU argmax (Nov 26)
+
+Qwen2.5-0.5B Q4_K_M, RTX 2060 SUPER, 40 tokens including prefill:
+
+| Configuration | tok/s |
+|---|---|
+| CUDA, direct launches | 192–226 |
+| CUDA, `CORTEX_CUDA_GRAPH=1` | 191–230 |
+| CUDA, `CORTEX_MMQ=1` (Q4_K fused kernel) | ~190 |
+
+Greedy CPU, CUDA and CUDA+graph produced byte-identical text for 30 tokens,
+so all three paths are correctness-checked. Neither graph nor MMQ closed the
+gap to llama.cpp CUDA (~338): the workload is dominated by weight streaming,
+not launch overhead. GPU argmax removes the per-token 608 KB logits copy but
+has little effect on total time.
+
+CUDA Graph replay initially produced wrong logits for two reasons: all
+`cuLaunchKernel` calls were pinned to the main stream while capture used
+another stream (empty graph), and the layer loop was still executed on replay
+(racing with the graph). Both fixed; capture mode is `0` and scalar kernel
+arguments use stable heap slots.

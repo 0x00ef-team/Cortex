@@ -50,6 +50,7 @@ type CuStreamBeginCapture = unsafe extern "C" fn(u64, u32) -> i32;
 type CuStreamEndCapture = unsafe extern "C" fn(u64, *mut u64) -> i32;
 type CuGraphInstantiate = unsafe extern "C" fn(*mut u64, u64, *mut u64, *mut c_char, usize, u32) -> i32;
 type CuGraphLaunch = unsafe extern "C" fn(u64, u64) -> i32;
+type CuGraphGetNodes = unsafe extern "C" fn(u64, *mut u64, *mut usize) -> i32;
 type CuStreamSynchronize = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoDAsync = unsafe extern "C" fn(u64, *const c_void, usize, u64) -> i32;
 
@@ -576,6 +577,93 @@ extern "C" __global__ void cortex_attention(
         oh[d] = acc;
     }
 }
+
+// Fused dequant+GEMV for Q4_K: a tile of 8 output rows is handled by 128
+// threads splitting the K dimension, instead of one thread per output row.
+extern "C" __global__ void mmq_q4_k(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    const int R = 8, T = 128;
+    const int nb = (cols + 255) / 256;
+    const int r0 = blockIdx.x * R;
+    const int tid = threadIdx.x;
+    extern __shared__ float xs[];
+    for (int c = tid; c < cols; c += T) xs[c] = x[c];
+    __syncthreads();
+    if (r0 >= rows) return;
+    const int nr = min(R, rows - r0);
+    float a[R];
+    #pragma unroll
+    for (int k = 0; k < R; ++k) a[k] = 0.f;
+    for (int b = tid; b < nb; b += T) {
+        #pragma unroll
+        for (int k = 0; k < R; ++k) if (k < nr) {
+            const int c0 = b * 256;
+            const unsigned char* bl = W + (size_t) (r0 + k) * nb * 144 + b * 144;
+            const float d = cortex_h2f(ld16(bl));
+            const float dm = cortex_h2f(ld16(bl + 2));
+            const unsigned char* sc = bl + 4;
+            const unsigned char* q = bl + 16;
+            int is = 0;
+            int c = c0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int s1, m1, s2, m2;
+                get_sm_k4(is, sc, &s1, &m1);
+                get_sm_k4(is + 1, sc, &s2, &m2);
+                const float d1 = d * s1, f1 = dm * m1;
+                const float d2 = d * s2, f2 = dm * m2;
+                #pragma unroll
+                for (int l = 0; l < 32; ++l) {
+                    a[k] += (d1 * (q[l] & 15) - f1) * xs[c + l];
+                    a[k] += (d2 * (q[l] >> 4) - f2) * xs[c + 32 + l];
+                }
+                q += 32; is += 2; c += 64;
+            }
+        }
+    }
+    __shared__ float red[R][T];
+    #pragma unroll
+    for (int k = 0; k < R; ++k) red[k][tid] = a[k];
+    __syncthreads();
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
+        #pragma unroll
+        for (int k = 0; k < R; ++k) if (tid < stride) red[k][tid] += red[k][tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        #pragma unroll
+        for (int k = 0; k < R; ++k) y[r0 + k] = red[k][0];
+    }
+}
+
+extern "C" __global__ void cortex_argmax(
+    const float* __restrict__ x, int* __restrict__ out, int n)
+{
+    __shared__ float vmax[256];
+    __shared__ int vidx[256];
+    int tid = threadIdx.x;
+    float best = -1e30f;
+    int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    vmax[tid] = best;
+    vidx[tid] = bi;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float a = vmax[tid], b = vmax[tid + stride];
+            if (b > a || (b == a && vidx[tid + stride] < vidx[tid])) {
+                vmax[tid] = b; vidx[tid] = vidx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) *out = vidx[0];
+}
 "#;
 
 /// A buffer allocated in device memory.
@@ -613,6 +701,8 @@ struct Api {
     function: u64,
     tall: u64,
     q4k: u64,
+    mmq_q4k: u64,
+    argmax: u64,
     q6k: u64,
     q5k: u64,
     q8_0: u64,
@@ -637,6 +727,7 @@ struct Api {
     end: CuStreamEndCapture,
     graph_inst: CuGraphInstantiate,
     graph_launch: CuGraphLaunch,
+    graph_nodes: CuGraphGetNodes,
     stream_sync: CuStreamSynchronize,
     memcpy_async: CuMemcpyHtoDAsync,
     cu_mem_alloc: CuMemAlloc,
@@ -704,6 +795,7 @@ impl CudaDevice {
             let cu_end: CuStreamEndCapture = ffi!(cuda, "cuStreamEndCapture", CuStreamEndCapture);
             let cu_graph_inst: CuGraphInstantiate = ffi!(cuda, "cuGraphInstantiate_v2", CuGraphInstantiate);
             let cu_graph_launch: CuGraphLaunch = ffi!(cuda, "cuGraphLaunch", CuGraphLaunch);
+            let cu_graph_nodes: CuGraphGetNodes = ffi!(cuda, "cuGraphGetNodes", CuGraphGetNodes);
             let cu_stream_sync: CuStreamSynchronize = ffi!(cuda, "cuStreamSynchronize", CuStreamSynchronize);
             let cu_memcpy_async: CuMemcpyHtoDAsync = ffi!(cuda, "cuMemcpyHtoDAsync_v2", CuMemcpyHtoDAsync);
 
@@ -758,6 +850,12 @@ impl CudaDevice {
             let mut kq4 = 0u64;
             let n = CString::new("matvec_q4_k").unwrap();
             check(cu_module_fn(&mut kq4, module, n.as_ptr()), "fn q4k")?;
+            let mut hmmq = 0u64;
+            let n = CString::new("mmq_q4_k").unwrap();
+            check(cu_module_fn(&mut hmmq, module, n.as_ptr()), "fn mmq_q4_k")?;
+            let mut hargmax = 0u64;
+            let n = CString::new("cortex_argmax").unwrap();
+            check(cu_module_fn(&mut hargmax, module, n.as_ptr()), "fn cortex_argmax")?;
             let mut kq6 = 0u64;
             let n = CString::new("matvec_q6_k").unwrap();
             check(cu_module_fn(&mut kq6, module, n.as_ptr()), "fn q6k")?;
@@ -809,8 +907,10 @@ impl CudaDevice {
 
             let mut stream = 0u64;
             check(cu_stream_create(&mut stream, 0), "cuStreamCreate")?;
-            let mut graph_stream = 0u64;
-            check(cu_stream_create(&mut graph_stream, 0), "cuStreamCreate")?;
+            // Capture on the main stream: input copies are synchronous and
+            // happen before capture; a separate capture stream makes replay
+            // ordering with those copies fragile on this driver.
+            let graph_stream = stream;
             if std::env::var_os("CORTEX_CUDA_DEBUG").is_some() { eprintln!("stream={stream}, ctx={ctx}, device={device}"); }
 
             LETS_FREE = std::mem::transmute::<CuMemFree, fn(u64)>(cu_mem_free);
@@ -820,6 +920,8 @@ impl CudaDevice {
                     function,
                     tall,
                     q4k: kq4,
+                    mmq_q4k: hmmq,
+                    argmax: hargmax,
                     q6k: kq6,
                     q5k: kq5,
                     q8_0: kq8,
@@ -844,6 +946,7 @@ impl CudaDevice {
                     end: cu_end,
                     graph_inst: cu_graph_inst,
                     graph_launch: cu_graph_launch,
+                    graph_nodes: cu_graph_nodes,
                     stream_sync: cu_stream_sync,
                     memcpy_async: cu_memcpy_async,
                     cu_mem_alloc,
@@ -907,6 +1010,10 @@ impl CudaDevice {
         unsafe { check((self.api.cu_sync)(), "cuCtxSynchronize") }
     }
 
+    pub fn sync(&self) -> Result<()> {
+        unsafe { check((self.api.stream_sync)(self.api.active_stream.get()), "cuStreamSynchronize") }
+    }
+
     pub fn copy_to_device_async(&self, dst: &CudaBuffer, src: &[f32]) -> Result<()> {
         unsafe {
             check(
@@ -934,6 +1041,33 @@ impl CudaDevice {
         }
     }
 
+    pub fn argmax_device(&self, x: &CudaBuffer, out: &CudaBuffer, n: usize) -> Result<()> {
+        let nn = n as i32;
+        let mut p: [*mut c_void; 3] = [
+            &x.ptr as *const u64 as *mut c_void,
+            &out.ptr as *const u64 as *mut c_void,
+            &nn as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.argmax, 1, 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch argmax",
+            )
+        }
+    }
+
+    pub fn copy_bytes_to_host(&self, dst: &mut [u8], src: &CudaBuffer) -> Result<()> {
+        unsafe {
+            check((self.api.cu_memcpy_d2h)(dst.as_mut_ptr() as *mut c_void, src.ptr, dst.len()), "cuMemcpyDtoH(bytes)")
+        }
+    }
+
+    pub fn debug_read_i32(&self, buf: &CudaBuffer) -> i32 {
+        let mut v = 0i32;
+        unsafe { (self.api.cu_memcpy_d2h)(&mut v as *mut i32 as *mut c_void, buf.ptr, 4); }
+        v
+    }
+
     pub fn activate_graph_stream(&self) {
         self.api.active_stream.set(self.api.graph_stream);
     }
@@ -943,7 +1077,7 @@ impl CudaDevice {
     }
 
     pub fn graph_begin(&self) -> Result<()> {
-        unsafe { check((self.api.begin)(self.api.graph_stream, 1), "cuStreamBeginCapture") }
+        unsafe { check((self.api.begin)(self.api.graph_stream, 0), "cuStreamBeginCapture") }
     }
 
     pub fn graph_end(&self) -> Result<()> {
@@ -955,6 +1089,11 @@ impl CudaDevice {
                 (self.api.graph_inst)(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
                 "cuGraphInstantiate",
             )?;
+            if std::env::var_os("CORTEX_GRAPH_DEBUG").is_some() {
+                let mut n = 0usize;
+                let st = (self.api.graph_nodes)(graph, std::ptr::null_mut(), &mut n);
+                eprintln!("[graph] captured nodes={n} status={st}");
+            }
             *self.api.graph.lock().unwrap() = Some(exec);
         }
         Ok(())
@@ -990,7 +1129,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.norm, 1, 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.norm, 1, 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch rmsnorm",
             )
         }
@@ -1018,7 +1157,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.rope, (total as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.rope, (total as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch rope",
             )
         }
@@ -1043,7 +1182,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.append, (width as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.append, (width as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch append_kv",
             )
         }
@@ -1057,7 +1196,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.bias, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.bias, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch add_bias",
             )
         }
@@ -1072,7 +1211,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.add, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.add, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch add",
             )
         }
@@ -1107,7 +1246,7 @@ impl CudaDevice {
         let shared = (512 + 128 + 1) * 4;
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.attn, n_heads as u32, 1, 1, 128, 1, 1, shared, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.attn, n_heads as u32, 1, 1, 128, 1, 1, shared, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch attention",
             )
         }
@@ -1122,7 +1261,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.swiglu, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.swiglu, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch swiglu",
             )
         }
@@ -1154,9 +1293,16 @@ impl CudaDevice {
             &rows as *const i32 as *mut c_void,
             &cols as *const i32 as *mut c_void,
         ];
+        let mmq = std::env::var_os("CORTEX_MMQ").is_some() && w.kind == 12;
+        let func = if mmq { self.api.mmq_q4k } else { func };
+        let (grid, threads, smem) = if mmq {
+            ((w.rows as u32).div_ceil(8), 128u32, (w.cols * 4) as u32)
+        } else {
+            (w.rows as u32, 128u32, 0u32)
+        };
         unsafe {
             check(
-                (self.api.cu_launch)(func, w.rows as u32, 1, 1, 128, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(func, grid, 1, 1, threads, 1, 1, smem, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch quantized matvec",
             )
         }
@@ -1176,7 +1322,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.f16_rows, (w.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.f16_rows, (w.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch f16 rows",
             )
         }
@@ -1207,7 +1353,7 @@ impl CudaDevice {
         let total = wq.rows + wk.rows + wv.rows;
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.qkv, (total as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.qkv, (total as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch qkv",
             )
         }
@@ -1232,7 +1378,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.gu, (wg.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.gu, (wg.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch gu",
             )
         }
@@ -1250,7 +1396,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.f32_rows, (rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.f32_rows, (rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch tall matvec",
             )
         }
@@ -1268,7 +1414,7 @@ impl CudaDevice {
         ];
         unsafe {
             check(
-                (self.api.cu_launch)(self.api.function, (rows as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                (self.api.cu_launch)(self.api.function, (rows as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.active_stream.get(), p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch f32 matvec",
             )
         }

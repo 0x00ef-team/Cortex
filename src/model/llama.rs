@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::tensor::{dot, DequantPolicy};
 use crate::thread_pool::ThreadPool;
 
-use super::attention::{rmsnorm, rope_table, rotate_half, softmax, swiglu};
+use super::attention::{rmsnorm, rope_table, rotate_half, swiglu};
 use super::cache::LayerCache;
 use super::config::{ModelConfig, RopeStyle};
 use super::weights::ModelWeights;
@@ -176,6 +176,24 @@ impl Llama {
         for c in &mut self.cache {
             c.clear();
         }
+    }
+
+    /// Greedy decode shortcut. On CUDA the output head stays in VRAM and only
+    /// the winning token id is copied back; on CPU it uses argmax on logits.
+    pub fn forward_greedy(&mut self, token: u32, pos: usize) -> Result<u32> {
+        if let Some(gpu) = &mut self.gpu_state {
+            let weights = &self.weights;
+            let config = &self.config;
+            return gpu.forward_argmax(weights, config, token, pos);
+        }
+        let logits = self.forward(token, pos)?;
+        let mut best = 0usize;
+        for i in 1..logits.len() {
+            if logits[i] > logits[best] {
+                best = i;
+            }
+        }
+        Ok(best as u32)
     }
 
     /// Run the transformer for one token at position `pos` and return logits.

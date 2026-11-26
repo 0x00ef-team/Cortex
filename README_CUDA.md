@@ -92,7 +92,7 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~228 tok/s** |
+| **Cortex CUDA** | **~226 tok/s** |
 | llama.cpp b12755, **CUDA**, 8 threads, ngl=99 | **~338 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
@@ -109,6 +109,29 @@ measured against the CPU build only. The remaining GPU gap is launch overhead
 Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
 kernel moved Cortex from ~36 to ~228 tok/s.
 
+## Optional paths (opt-in)
+
+```bash
+CORTEX_CUDA_GRAPH=1 ./target/release/examples/bench MODEL "Once upon a time" 40 --device cuda
+CORTEX_MMQ=1 ./target/release/examples/bench MODEL "Once upon a time" 40 --device cuda
+```
+
+- `CORTEX_CUDA_GRAPH=1` captures the whole forward step (all layers, final norm,
+  output head and, in greedy mode, argmax) and replays it. Input copies still
+  happen per token before replay. On RTX 2060 SUPER this is throughput-neutral
+  (~200–230 tok/s) — decode is bandwidth-bound, so launch overhead is not the
+  bottleneck. It is kept as a correctness-checked option for other GPUs.
+- `CORTEX_MMQ=1` uses a fused Q4_K dequant+GEMV kernel (8 rows per CTA, K split
+  across 128 threads). Logits are identical to the scalar kernel; measured
+  throughput on RTX 2060 SUPER is also neutral (~190 tok/s).
+- Greedy decoding (`--temp 0`) now keeps logits in VRAM and copies back only
+  the winning token id via `cortex_argmax`, removing a ~608 KB D2H copy per
+  token. Sampling paths are unchanged.
+
+`tools/mcp_server.py` and `.opencode/plugins/cortex/index.ts` add helper tools
+(`cortex_bench`, `cortex_parity`, `cortex_test`, `cortex_status`) for OpenCode.
+Run `cortex_parity` to confirm CPU and CUDA greedy output match.
+
 ## Roadmap
 
 - [x] FFI wrapper for CUDA Driver API + NVRTC
@@ -117,7 +140,7 @@ kernel moved Cortex from ~36 to ~228 tok/s.
 - [x] Integration into `Llama::forward` via `Device`
 - [x] Benchmarks with `--device cuda`
 - [ ] GPU kernels for Q4_K/Q8_0 (large models in VRAM)
-- [ ] CUDA Graphs and stream overlap
+- [x] CUDA Graphs (opt-in, `CORTEX_CUDA_GRAPH=1`)
 - [ ] Attention / softmax on GPU
 - [ ] Keep residuals/norms on GPU: currently ~97 synchronizations per token,
       one per layer group; fusing the whole layer would cut this to ~3

@@ -66,10 +66,19 @@ where
         prompt_ids.truncate(ctx);
     }
 
-    // Prefill: feed all prompt tokens through the transformer.
+    // Prefill: only the last prompt token's logits are ever sampled.
+    // In greedy mode ask for just the argmax, avoiding a full logits copy.
+    let greedy = cfg.temperature <= 0.0 && cfg.repeat_penalty == 1.0;
     let mut logits = Vec::new();
-    for (pos, &id) in prompt_ids.iter().enumerate() {
-        logits = model.forward(id, pos)?;
+    let mut greedy_next = 0u32;
+    if greedy {
+        for (pos, &id) in prompt_ids.iter().enumerate() {
+            greedy_next = model.forward_greedy(id, pos)?;
+        }
+    } else {
+        for (pos, &id) in prompt_ids.iter().enumerate() {
+            logits = model.forward(id, pos)?;
+        }
     }
     let mut pos = prompt_ids.len();
 
@@ -84,7 +93,11 @@ where
     let mut produced: Vec<u32> = Vec::new();
     let mut text = String::new();
     let mut pending: Vec<u8> = Vec::new();
-    let mut next = sampler.sample(&logits, &all_ids)?;
+    let mut next = if greedy {
+        greedy_next
+    } else {
+        sampler.sample(&logits, &all_ids)?
+    };
 
     for _ in 0..cfg.max_tokens {
         if cfg.stop_on_eos && next == tokenizer.eos() {
@@ -114,9 +127,13 @@ where
 
         all_ids.push(next);
         produced.push(next);
-        logits = model.forward(next, pos)?;
+        next = if greedy {
+            model.forward_greedy(next, pos)?
+        } else {
+            logits = model.forward(next, pos)?;
+            sampler.sample(&logits, &all_ids)?
+        };
         pos += 1;
-        next = sampler.sample(&logits, &all_ids)?;
     }
 
     if !pending.is_empty() {

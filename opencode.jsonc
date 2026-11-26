@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "cortex": {
+        "type": "local",
+        "command": ["python3", "tools/mcp_server.py"],
+        "cwd": ".",
+        "codemode": true,
+        "timeout": {
+          "execution": 1200000
+        }
+      }
+    }
+  }
+}

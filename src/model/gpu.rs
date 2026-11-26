@@ -107,6 +107,7 @@ pub(crate) struct LlamaGpu {
     act: CudaBuffer,
     down: CudaBuffer,
     logits: CudaBuffer,
+    argmax_out: CudaBuffer,
     cos: CudaBuffer,
     sin: CudaBuffer,
     pos_dev: CudaBuffer,
@@ -189,6 +190,7 @@ impl LlamaGpu {
         let cos = dev.alloc(half)?;
         let sin = dev.alloc(half)?;
         let pos_dev = dev.alloc(1)?;
+        let dev_clone = Arc::clone(&dev);
         Ok(Self {
             dev,
             layers,
@@ -207,6 +209,7 @@ impl LlamaGpu {
             act,
             down,
             logits,
+            argmax_out: dev_clone.alloc(1)?,
             cos,
             sin,
             pos_dev,
@@ -242,6 +245,34 @@ impl LlamaGpu {
         token: u32,
         pos: usize,
     ) -> Result<Vec<f32>> {
+        self.forward_inner(weights, cfg, token, pos, false)?;
+        let mut logits = vec![0f32; cfg.vocab_size];
+        self.dev.copy_to_host(&mut logits, &self.logits)?;
+        Ok(logits)
+    }
+
+    /// Greedy decode: keep logits on device and copy back only the token id.
+    pub fn forward_argmax(
+        &mut self,
+        weights: &ModelWeights,
+        cfg: &ModelConfig,
+        token: u32,
+        pos: usize,
+    ) -> Result<u32> {
+        self.forward_inner(weights, cfg, token, pos, true)?;
+        let mut bytes = [0u8; 4];
+        self.dev.copy_bytes_to_host(&mut bytes, &self.argmax_out)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn forward_inner(
+        &mut self,
+        weights: &ModelWeights,
+        cfg: &ModelConfig,
+        token: u32,
+        pos: usize,
+        argmax: bool,
+    ) -> Result<()> {
         if token as usize >= cfg.vocab_size {
             return Err(Error::InvalidToken(token));
         }
@@ -256,20 +287,21 @@ impl LlamaGpu {
         weights.token_embd.row(token as usize, &mut emb)?;
         // With graphs, keep input copies synchronous so no pending work can be
         // tangled with capture/replay on the same stream.
-        if graph_mode {
-            self.dev.copy_to_device(&self.x, &emb)?;
-            self.dev.copy_to_device(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
-            self.dev.copy_to_device(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
-            self.dev.copy_bytes_to_device(&self.pos_dev, &(pos as i32).to_le_bytes())?;
-        } else {
-            self.dev.copy_to_device_async(&self.x, &emb)?;
-            self.dev.copy_to_device_async(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
-            self.dev.copy_to_device_async(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
-            self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
-        }
+        self.dev.copy_to_device_async(&self.x, &emb)?;
+        self.dev.copy_to_device_async(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
+        self.dev.copy_to_device_async(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
+        self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
         if capture {
+            self.dev.sync()?;
             self.dev.activate_graph_stream();
             self.dev.graph_begin()?;
+        } else if graph_mode && self.dev.graph_ready() {
+            // Replay only: the captured graph already contains every layer,
+            // the final norm and the output head. Re-enqueueing them here
+            // would race with the replay and double the work.
+            self.dev.graph_launch()?;
+            self.dev.stream_sync()?;
+            return Ok(());
         }
 
         let mut cur = &self.x;
@@ -319,6 +351,10 @@ impl LlamaGpu {
         let t_layer = t_start.elapsed();
         self.dev.rmsnorm_device(cur, &self.final_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
         self.mv_out(&self.xb, &self.logits, cfg.vocab_size, self.n_embd)?;
+        if argmax {
+            self.dev.argmax_device(&self.logits, &self.argmax_out, cfg.vocab_size)?;
+        }
+        let t_head = t_start.elapsed();
         if capture {
             self.dev.graph_end()?;
             self.dev.activate_main_stream();
@@ -330,12 +366,14 @@ impl LlamaGpu {
         } else {
             self.dev.synchronize()?;
         }
+        let t_sync = t_start.elapsed();
+        if std::env::var_os("CORTEX_GPU_PROFILE").is_some() {
+            eprintln!("[gpu-profile] head={:?} sync={:?}", t_head - t_layer, t_sync - t_head);
+        }
         let t_all = t_start.elapsed();
         if std::env::var_os("CORTEX_GPU_PROFILE").is_some() {
             eprintln!("[gpu-profile] layers={:?} total={:?}", t_layer, t_all);
         }
-        let mut logits = vec![0f32; cfg.vocab_size];
-        self.dev.copy_to_host(&mut logits, &self.logits)?;
-        Ok(logits)
+        Ok(())
     }
 }
