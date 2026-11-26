@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    eprintln!("DBG loading"); let mut engine = Engine::load(path, options)?; eprintln!("DBG loaded");
+    let mut engine = Engine::load(path, options)?;
     let load = t0.elapsed();
 
     let cfg = GenerateConfig {
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     let t1 = Instant::now();
-    eprintln!("DBG generating"); let out = engine.generate(&prompt, &cfg, |_, _| {})?; eprintln!("DBG generated");
+    let out = engine.generate(&prompt, &cfg, |_, _| {})?;
     let total = t1.elapsed();
 
     println!("model:        {path}");
