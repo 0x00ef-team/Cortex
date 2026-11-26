@@ -17,7 +17,8 @@ external dependencies** for the CPU path — no `ndarray`, no `candle`, no
 `llama.cpp`, no tokenizer crates. Just `std`.
 
 It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.)
-and **Gemma 4** dense text models, including quantized weights, and offers an
+and **Gemma 4** dense text models. An experimental CPU path for the hybrid
+`ornith 1.5 9b` model (Qwen3.5 SSM + attention) is also included, but its output is not yet validated. The engine offers an
 optional CUDA backend that is ~1.7× faster than llama.cpp **CPU** on the test
 machine (but ~1.7× slower than llama.cpp CUDA). GGUF files are memory-mapped, so
 loading a 4.8 GB model takes ~0.5 s. The local crate in `Cargo.toml` is named
@@ -29,7 +30,7 @@ loading a 4.8 GB model takes ~0.5 s. The local crate in `Cargo.toml` is named
 | Subsystem | What is implemented |
 |---|---|
 | GGUF v3 | Header, metadata and tensor descriptors; tensor data is memory-mapped (zero-copy) |
-| Architectures | LLaMA/Mistral/Qwen2-style transformers plus Gemma 4 (SWA/global layers, per-layer embeddings, shared KV, softcapping) |
+| Architectures | LLaMA/Mistral/Qwen2-style transformers, Gemma 4 (SWA/global layers, per-layer embeddings, shared KV, softcapping), experimental `ornith 1.5 9b` hybrid (SSM + attention) |
 | Quantization | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — all dequantizers ported from the reference ggml C code |
 | Math | Unrolled `dot`, AVX/SSE4.1 SIMD fused kernels, RMSNorm, stable softmax, RoPE (LLaMA + NeoX), SwiGLU |
 | Transformer | LLaMA-style blocks, grouped-query attention, geometrically growing KV cache, Qwen attention biases |
@@ -78,6 +79,9 @@ cargo run --release --example bench -- model.gguf "Once upon a time" 64 --thread
 
 # Gemma 4 (CPU)
 cargo run --release --example gemma4 -- gemma4.gguf "Hello" --max 32
+
+# ornith 1.5 9b (CPU, Qwen3.5 hybrid)
+cargo run --release --example qwen35 -- ornith-1.5-9b.Q8_0.gguf "Hello" --max 8
 ```
 
 GPU:
@@ -127,6 +131,7 @@ src/
   model/             config, attention kernels, KV cache, weights, forward pass
   cuda.rs            CUDA driver FFI, NVRTC JIT, GPU matvec
   model/gemma4.rs    Gemma 4 architecture (SWA, per-layer embeddings, shared KV)
+  model/qwen35.rs    `ornith 1.5 9b` hybrid: SSM/GDN layers + full attention
   sampler.rs         next-token sampling
   generate.rs        generation loop
   synthetic.rs       test-model generator
@@ -157,9 +162,10 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 
 Движок запускает GGUF-модели семейства LLaMA (LLaMA 2/3, Mistral, Qwen2,
 CodeLlama и др.) и плотные текстовые модели **Gemma 4**, включая квантованные
-веса. GGUF-файлы отображаются в память через mmap, поэтому загрузка модели
+веса. Экспериментальный CPU-путь поддерживает гибрид `ornith 1.5 9b` (SSM + внимание), но корректность генерации пока не подтверждена.
+GGUF-файлы отображаются в память через mmap, поэтому загрузка модели
 на 4.8 ГБ занимает ~0.5 с. Есть опциональный CUDA-бэкенд, который на тестовой
-машине **примерно в 1.7 раза быстрее llama.cpp CPU** (но ~в 8 раз медленнее llama.cpp CUDA).
+машине **примерно в 1.7 раза быстрее llama.cpp CPU** (но ~в 1.7 раза медленнее llama.cpp CUDA).
 В `Cargo.toml` локальный пакет называется `cortex-llm` (на crates.io он пока не опубликован), библиотека по-прежнему импортируется как `cortex`.
 
 ### Возможности
@@ -167,7 +173,7 @@ CodeLlama и др.) и плотные текстовые модели **Gemma 4*
 | Подсистема | Что реализовано |
 |---|---|
 | GGUF v3 | Парсер заголовка и метаданных; данные memory-mapped (без копирования) |
-| Архитектуры | Трансформеры LLaMA/Mistral/Qwen2 и Gemma 4 (SWA/global слои, per-layer embeddings, общий KV, softcapping) |
+| Архитектуры | Трансформеры LLaMA/Mistral/Qwen2, Gemma 4 (SWA/global слои, per-layer embeddings, общий KV, softcapping), экспериментальный гибрид `ornith 1.5 9b` (SSM + attention) |
 | Квантование | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — деквантовщики портированы с эталонного C-кода ggml |
 | Математика | Развёрнутый `dot`, AVX/SSE4.1 SIMD-ядра, RMSNorm, стабильный softmax, RoPE (LLaMA и NeoX), SwiGLU |
 | Трансформер | Блоки LLaMA, grouped-query attention, KV-кэш с геометрическим ростом, attention-биасы Qwen |
@@ -216,6 +222,9 @@ cargo run --release --example bench -- model.gguf "Once upon a time" 64 --thread
 
 # Gemma 4 (CPU)
 cargo run --release --example gemma4 -- gemma4.gguf "Hello" --max 32
+
+# ornith 1.5 9b (CPU, гибрид Qwen3.5)
+cargo run --release --example qwen35 -- ornith-1.5-9b.Q8_0.gguf "Hello" --max 8
 ```
 
 GPU:
@@ -263,6 +272,7 @@ src/
   model/             конфиг, ядра attention, KV-кэш, веса, forward pass
   cuda.rs            FFI к CUDA Driver API, NVRTC JIT, GPU matvec
   model/gemma4.rs    архитектура Gemma 4 (SWA, per-layer embeddings, общий KV)
+  model/qwen35.rs    гибрид `ornith 1.5 9b`: SSM/GDN-слои + полное внимание
   sampler.rs         выбор следующего токена
   generate.rs        цикл генерации
   synthetic.rs       генератор тестовой модели
