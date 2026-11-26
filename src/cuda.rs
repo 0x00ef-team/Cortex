@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::cell::Cell;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
@@ -629,6 +630,8 @@ struct Api {
     bias: u64,
     attn: u64,
     stream: u64,
+    graph_stream: u64,
+    active_stream: Cell<u64>,
     graph: Mutex<Option<u64>>,
     begin: CuStreamBeginCapture,
     end: CuStreamEndCapture,
@@ -806,6 +809,8 @@ impl CudaDevice {
 
             let mut stream = 0u64;
             check(cu_stream_create(&mut stream, 0), "cuStreamCreate")?;
+            let mut graph_stream = 0u64;
+            check(cu_stream_create(&mut graph_stream, 0), "cuStreamCreate")?;
             if std::env::var_os("CORTEX_CUDA_DEBUG").is_some() { eprintln!("stream={stream}, ctx={ctx}, device={device}"); }
 
             LETS_FREE = std::mem::transmute::<CuMemFree, fn(u64)>(cu_mem_free);
@@ -832,6 +837,8 @@ impl CudaDevice {
                     bias: hbias,
                     attn: hatt,
                     stream,
+                    graph_stream,
+                    active_stream: Cell::new(stream),
                     graph: Mutex::new(None),
                     begin: cu_begin,
                     end: cu_end,
@@ -903,7 +910,7 @@ impl CudaDevice {
     pub fn copy_to_device_async(&self, dst: &CudaBuffer, src: &[f32]) -> Result<()> {
         unsafe {
             check(
-                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len() * 4, self.api.stream),
+                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len() * 4, self.api.active_stream.get()),
                 "cuMemcpyHtoDAsync",
             )
         }
@@ -921,20 +928,28 @@ impl CudaDevice {
     pub fn copy_bytes_to_device_async(&self, dst: &CudaBuffer, src: &[u8]) -> Result<()> {
         unsafe {
             check(
-                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len(), self.api.stream),
+                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len(), self.api.active_stream.get()),
                 "cuMemcpyHtoDAsync(bytes)",
             )
         }
     }
 
+    pub fn activate_graph_stream(&self) {
+        self.api.active_stream.set(self.api.graph_stream);
+    }
+
+    pub fn activate_main_stream(&self) {
+        self.api.active_stream.set(self.api.stream);
+    }
+
     pub fn graph_begin(&self) -> Result<()> {
-        unsafe { check((self.api.begin)(self.api.stream, 1), "cuStreamBeginCapture") }
+        unsafe { check((self.api.begin)(self.api.graph_stream, 1), "cuStreamBeginCapture") }
     }
 
     pub fn graph_end(&self) -> Result<()> {
         let mut graph = 0u64;
         unsafe {
-            check((self.api.end)(self.api.stream, &mut graph), "cuStreamEndCapture")?;
+            check((self.api.end)(self.api.graph_stream, &mut graph), "cuStreamEndCapture")?;
             let mut exec = 0u64;
             check(
                 (self.api.graph_inst)(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
@@ -951,11 +966,11 @@ impl CudaDevice {
 
     pub fn graph_launch(&self) -> Result<()> {
         let exec = self.api.graph.lock().unwrap().unwrap();
-        unsafe { check((self.api.graph_launch)(exec, self.api.stream), "cuGraphLaunch") }
+        unsafe { check((self.api.graph_launch)(exec, self.api.active_stream.get()), "cuGraphLaunch") }
     }
 
     pub fn stream_sync(&self) -> Result<()> {
-        unsafe { check((self.api.stream_sync)(self.api.stream), "cuStreamSynchronize") }
+        unsafe { check((self.api.stream_sync)(self.api.active_stream.get()), "cuStreamSynchronize") }
     }
 
     pub fn rmsnorm_device(

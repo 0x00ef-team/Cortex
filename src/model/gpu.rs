@@ -247,26 +247,28 @@ impl LlamaGpu {
         }
 
         let t_start = Instant::now();
+        self.calls += 1;
+        let graph_mode = std::env::var_os("CORTEX_CUDA_GRAPH").is_some() && self.calls >= 2;
+        let capture = graph_mode && !self.dev.graph_ready();
+
         // Embedding lookup stays on the host (one row, tiny).
         let mut emb = vec![0f32; self.n_embd];
         weights.token_embd.row(token as usize, &mut emb)?;
-        self.dev.copy_to_device_async(&self.x, &emb)?;
-        self.dev.copy_to_device_async(
-            &self.cos,
-            &self.cos_table[pos * self.half..(pos + 1) * self.half],
-        )?;
-        self.dev.copy_to_device_async(
-            &self.sin,
-            &self.sin_table[pos * self.half..(pos + 1) * self.half],
-        )?;
-
-        self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
-        // CUDA Graph replay is experimental and currently differs from the
-        // direct path; keep direct launches as the default.
-        self.calls += 1;
-        let use_graph = std::env::var_os("CORTEX_CUDA_GRAPH").is_some() && self.calls >= 2;
-        let capture = use_graph && !self.dev.graph_ready();
+        // With graphs, keep input copies synchronous so no pending work can be
+        // tangled with capture/replay on the same stream.
+        if graph_mode {
+            self.dev.copy_to_device(&self.x, &emb)?;
+            self.dev.copy_to_device(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
+            self.dev.copy_to_device(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
+            self.dev.copy_bytes_to_device(&self.pos_dev, &(pos as i32).to_le_bytes())?;
+        } else {
+            self.dev.copy_to_device_async(&self.x, &emb)?;
+            self.dev.copy_to_device_async(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
+            self.dev.copy_to_device_async(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
+            self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
+        }
         if capture {
+            self.dev.activate_graph_stream();
             self.dev.graph_begin()?;
         }
 
@@ -319,9 +321,10 @@ impl LlamaGpu {
         self.mv_out(&self.xb, &self.logits, cfg.vocab_size, self.n_embd)?;
         if capture {
             self.dev.graph_end()?;
+            self.dev.activate_main_stream();
             self.dev.graph_launch()?;
             self.dev.stream_sync()?;
-        } else if use_graph && self.dev.graph_ready() {
+        } else if graph_mode && self.dev.graph_ready() {
             self.dev.graph_launch()?;
             self.dev.stream_sync()?;
         } else {

@@ -28,7 +28,7 @@ prompt included in Cortex throughput, 8 CPU threads where applicable.
 
 | Configuration | Throughput | Command |
 |---|---|---|
-| **Cortex CUDA** | **~210 tok/s** | `examples/bench --device cuda` |
+| **Cortex CUDA** | **~228 tok/s** | `examples/bench --device cuda` |
 | llama.cpp CUDA, ngl=99 | **338 ± 37 tok/s** | `llama-bench -ngl 99 -n 32` |
 | llama.cpp CUDA, prompt eval (pp4) | 795 ± 179 tok/s | same |
 | llama.cpp CPU, 8 threads | ~24 tok/s | `llama-bench -n 8` |

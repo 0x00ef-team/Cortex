@@ -95,7 +95,7 @@ See [README_CUDA.md](README_CUDA.md) for the CUDA backend design and benchmarks.
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~210 tok/s** |
+| **Cortex CUDA** | **~228 tok/s** |
 | llama.cpp b12755, CUDA, 8 threads | ~338 tok/s |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~4–10 tok/s |
@@ -233,7 +233,7 @@ cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
 
 | Конфигурация | Скорость |
 |---|---|
-| **Cortex CUDA** | **~210 ток/с** |
+| **Cortex CUDA** | **~228 ток/с** |
 | llama.cpp b12755, CUDA, 8 потоков | ~338 ток/с |
 | llama.cpp b12755, CPU, 8 потоков | ~24 ток/с |
 | Cortex CPU, Lazy + SIMD | ~4–10 ток/с |
