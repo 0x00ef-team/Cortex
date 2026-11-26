@@ -39,7 +39,7 @@ pub mod tokenizer;
 pub use error::{Error, Result};
 pub use cuda::CudaDevice;
 pub use generate::{generate, GenerateConfig, GenerateOutput};
-pub use model::{Llama, LoadOptions, ModelConfig, RopeStyle};
+pub use model::{Gemma4, Gemma4Config, Llama, LoadOptions, ModelConfig, RopeStyle};
 pub use sampler::{Rng, Sampler};
 pub use tensor::DequantPolicy;
 pub use thread_pool::ThreadPool;

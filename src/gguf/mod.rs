@@ -4,8 +4,10 @@
 //! metadata key/value store and tensor descriptors; tensor data is read
 //! lazily directly from the file.
 
+mod mmap;
 mod reader;
 mod value;
 
+pub use mmap::Mmap;
 pub use reader::{GgufFile, TensorInfo};
 pub use value::Value;

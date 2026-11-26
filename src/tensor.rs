@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::gguf::Mmap;
 use crate::thread_pool::ThreadPool;
 use crate::quant::{
     dequantize_row_layout, detect_q8_1_layout, ggml_type, is_supported, row_bytes, type_name,
@@ -24,11 +25,31 @@ pub enum DequantPolicy {
     Lazy,
 }
 
+enum Bytes {
+    Owned(Arc<Vec<u8>>),
+    Mapped {
+        map: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl Bytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Owned(v) => v.as_slice(),
+            Bytes::Mapped { map, offset, len } => map
+                .slice(*offset, *len)
+                .expect("tensor range was validated when the view was created"),
+        }
+    }
+}
+
 enum Storage {
     F32(Vec<f32>),
     Raw {
         kind: u32,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         q8_layout: Q8Layout,
     },
 }
@@ -70,9 +91,7 @@ impl Matrix {
         }
     }
 
-    /// Build a matrix from GGUF tensor bytes.
-    ///
-    /// `rows` / `cols` are derived from the GGUF shape (`dims[1]`, `dims[0]`).
+    /// Build a matrix from GGUF tensor bytes (copies the bytes).
     pub fn from_gguf(
         kind: u32,
         rows: usize,
@@ -80,23 +99,57 @@ impl Matrix {
         bytes: &[u8],
         policy: DequantPolicy,
     ) -> Result<Self> {
+        Self::from_bytes(
+            kind,
+            rows,
+            cols,
+            Bytes::Owned(Arc::new(bytes.to_vec())),
+            policy,
+        )
+    }
+
+    /// Build a matrix from a zero-copy slice of a memory-mapped GGUF file.
+    pub fn from_gguf_mapped(
+        kind: u32,
+        rows: usize,
+        cols: usize,
+        map: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+        policy: DequantPolicy,
+    ) -> Result<Self> {
+        Self::from_bytes(
+            kind,
+            rows,
+            cols,
+            Bytes::Mapped { map, offset, len },
+            policy,
+        )
+    }
+
+    fn from_bytes(
+        kind: u32,
+        rows: usize,
+        cols: usize,
+        bytes: Bytes,
+        policy: DequantPolicy,
+    ) -> Result<Self> {
         if !is_supported(kind) {
             return Err(Error::UnsupportedType(kind));
         }
         let needed = row_bytes(kind, cols).saturating_mul(rows);
-        if bytes.len() < needed {
+        if bytes.as_slice().len() < needed {
             return Err(Error::ShapeMismatch(format!(
                 "{} matrix {rows}x{cols} needs {needed} bytes, got {}",
                 type_name(kind),
-                bytes.len()
+                bytes.as_slice().len()
             )));
         }
-        let bytes = &bytes[..needed];
 
         // Q8_1 changed its field order between ggml revisions; decide once
         // per tensor so every row is decoded consistently.
         let q8_layout = if kind == ggml_type::Q8_1 {
-            detect_q8_1_layout(bytes, cols, rows)
+            detect_q8_1_layout(bytes.as_slice(), cols, rows)
         } else {
             Q8Layout::New
         };
@@ -105,8 +158,9 @@ impl Matrix {
             DequantPolicy::Eager => {
                 let mut values = vec![0.0f32; rows * cols];
                 let rb = row_bytes(kind, cols);
+                let data = bytes.as_slice();
                 for r in 0..rows {
-                    let src = &bytes[r * rb..(r + 1) * rb];
+                    let src = &data[r * rb..(r + 1) * rb];
                     let dst = &mut values[r * cols..(r + 1) * cols];
                     if !dequantize_row_layout(kind, src, dst, cols, q8_layout) {
                         return Err(Error::UnsupportedType(kind));
@@ -114,11 +168,7 @@ impl Matrix {
                 }
                 Storage::F32(values)
             }
-            DequantPolicy::Lazy => Storage::Raw {
-                kind,
-                bytes: bytes.to_vec(),
-                q8_layout,
-            },
+            DequantPolicy::Lazy => Storage::Raw { kind, bytes, q8_layout },
         };
 
         Ok(Self {
@@ -172,7 +222,7 @@ impl Matrix {
                 let mut tmp = vec![0.0f32; self.cols];
                 if !dequantize_row_layout(
                     *kind,
-                    &bytes[r * rb..(r + 1) * rb],
+                    &bytes.as_slice()[r * rb..(r + 1) * rb],
                     &mut tmp,
                     self.cols,
                     *q8_layout,
@@ -300,7 +350,7 @@ impl Matrix {
                 // buffer and accumulate immediately. This avoids materializing
                 // a full f32 row in memory for every matvec.
                 for r in start..end {
-                    let row = &bytes[r * rb..(r + 1) * rb];
+                    let row = &bytes.as_slice()[r * rb..(r + 1) * rb];
                     if let Some(v) = crate::quant::dot_quant(*kind, row, x, self.cols, *q8_layout) {
                         out[r - start] = v;
                     } else if *kind == ggml_type::F32 || *kind == ggml_type::F16

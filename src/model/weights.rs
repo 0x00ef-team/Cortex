@@ -45,8 +45,8 @@ fn load_matrix(gguf: &mut GgufFile, name: &str, policy: DequantPolicy) -> Result
             )))
         }
     };
-    let bytes = gguf.tensor_bytes(name)?;
-    Matrix::from_gguf(kind, rows, cols, &bytes, policy)
+    let (map, offset, len) = gguf.tensor_view(name)?;
+    Matrix::from_gguf_mapped(kind, rows, cols, map, offset, len, policy)
 }
 
 fn load_optional_matrix(

@@ -13,6 +13,8 @@ pub enum PreTokenizer {
     SentencePiece,
     /// GPT-2 / Qwen style: bytes are mapped to printable Unicode codepoints.
     ByteBpe,
+    /// Gemma 4: `▁` space marker with an explicit BPE merge list.
+    Gemma,
 }
 
 const SPACE_MARK: char = '\u{2581}';
@@ -32,6 +34,7 @@ pub struct Tokenizer {
     pub unk: u32,
     pub add_bos: bool,
     pub add_eos: bool,
+    pub add_space_prefix: bool,
     pub pre: PreTokenizer,
     byte_to_unicode: [char; 256],
     unicode_to_byte: HashMap<char, u8>,
@@ -62,7 +65,16 @@ impl Tokenizer {
         scores.resize(tokens.len(), 0.0);
 
         let pre_name = gguf.get_str("tokenizer.ggml.pre").unwrap_or_default();
-        let pre = if pre_name.contains("gpt2") || pre_name.contains("qwen") {
+        let model_name = gguf.get_str("tokenizer.ggml.model").unwrap_or_default();
+        let byte_bpe = pre_name.contains("gpt2")
+            || pre_name.contains("qwen")
+            || pre_name.contains("gemma")
+            || model_name.contains("gpt2")
+            || model_name.contains("qwen")
+            || model_name.contains("gemma");
+        let pre = if model_name.contains("gemma") || pre_name.contains("gemma") {
+            PreTokenizer::Gemma
+        } else if byte_bpe {
             PreTokenizer::ByteBpe
         } else {
             PreTokenizer::SentencePiece
@@ -92,6 +104,12 @@ impl Tokenizer {
             .get_u32("tokenizer.ggml.unknown_token_id")
             .or_else(|| gguf.get_u32("tokenizer.ggml.unknown_token"))
             .unwrap_or(0);
+
+        let add_space_prefix = gguf
+            .metadata
+            .get("tokenizer.ggml.add_space_prefix")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         let add_bos = gguf
             .metadata
@@ -132,6 +150,7 @@ impl Tokenizer {
             unk,
             add_bos,
             add_eos,
+            add_space_prefix,
             pre,
             byte_to_unicode,
             unicode_to_byte,
@@ -189,9 +208,9 @@ impl Tokenizer {
         }
         // Same normalization as `encode`, factored out for clarity.
         let normalized = match self.pre {
-            PreTokenizer::SentencePiece => {
+            PreTokenizer::SentencePiece | PreTokenizer::Gemma => {
                 let mut s = String::new();
-                if !text.starts_with(' ') {
+                if self.add_space_prefix && !text.starts_with(' ') {
                     s.push(SPACE_MARK);
                 }
                 for c in text.chars() {
@@ -277,15 +296,20 @@ impl Tokenizer {
         }
 
         match self.pre {
-            PreTokenizer::SentencePiece => {
-                // Replace `▁` with a normal space when the stored token uses it.
-                if tok.starts_with(SPACE_MARK_BYTES) {
-                    let mut out = vec![b' '];
-                    out.extend_from_slice(&tok[SPACE_MARK_BYTES.len()..]);
-                    Ok(out)
-                } else {
-                    Ok(tok.clone())
+            PreTokenizer::SentencePiece | PreTokenizer::Gemma => {
+                // Replace every `▁` (U+2581) with a normal space.
+                let mut out = Vec::with_capacity(tok.len());
+                let mut i = 0;
+                while i < tok.len() {
+                    if tok[i..].starts_with(SPACE_MARK_BYTES) {
+                        out.push(b' ');
+                        i += SPACE_MARK_BYTES.len();
+                    } else {
+                        out.push(tok[i]);
+                        i += 1;
+                    }
                 }
+                Ok(out)
             }
             PreTokenizer::ByteBpe => {
                 let s = String::from_utf8_lossy(tok);
@@ -395,6 +419,7 @@ mod tests {
             unk: 0,
             add_bos: false,
             add_eos: false,
+            add_space_prefix: true,
             pre: PreTokenizer::SentencePiece,
             byte_to_unicode: byte_unicode_tables().0,
             unicode_to_byte: byte_unicode_tables().1,

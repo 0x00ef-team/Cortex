@@ -5,9 +5,12 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::quant::row_bytes;
 
+use super::mmap::Mmap;
 use super::value::{gguf_value_type as vt, Value};
 
 /// Descriptor of one tensor in a GGUF file.
@@ -45,6 +48,7 @@ impl TensorInfo {
 /// An opened GGUF file. Metadata is parsed eagerly; tensor data is not.
 pub struct GgufFile {
     file: File,
+    map: Arc<Mmap>,
     data_start: u64,
     pub version: u32,
     pub metadata: HashMap<String, Value>,
@@ -122,7 +126,8 @@ impl GgufFile {
         }
 
         Ok(Self {
-            file: File::open(path)?,
+            file: File::open(path.as_ref())?,
+            map: Mmap::open(path.as_ref())?,
             data_start,
             version,
             metadata,
@@ -139,7 +144,7 @@ impl GgufFile {
             .ok_or_else(|| Error::MissingTensor(name.to_owned()))
     }
 
-    /// Read the raw bytes of a tensor from the data section.
+    /// Read the raw bytes of a tensor from the data section (copies data).
     pub fn tensor_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
         let info = self.info(name)?;
         let len = info.byte_len()?;
@@ -151,6 +156,21 @@ impl GgufFile {
         let mut buf = vec![0u8; len];
         self.file.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Zero-copy view of a tensor in the memory-mapped file.
+    /// Returns `(mapping, byte_offset, byte_len)`.
+    pub fn tensor_view(&self, name: &str) -> Result<(Arc<Mmap>, usize, usize)> {
+        let info = self.info(name)?;
+        let len = info.byte_len()?;
+        let offset = self
+            .data_start
+            .checked_add(info.offset)
+            .ok_or_else(|| Error::InvalidGguf("tensor offset overflow".into()))?
+            as usize;
+        // Validate the range now so later accesses can be unchecked-ish.
+        self.map.slice(offset, len)?;
+        Ok((Arc::clone(&self.map), offset, len))
     }
 
     /// Convenience accessors for metadata.

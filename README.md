@@ -14,15 +14,17 @@
 external dependencies** for the CPU path — no `ndarray`, no `candle`, no
 `llama.cpp`, no tokenizer crates. Just `std`.
 
-It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.),
-including quantized weights, and offers an optional CUDA backend that is about
-**1.7× faster than llama.cpp** on the test machine.
+It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.)
+and **Gemma 4** dense text models, including quantized weights, and offers an
+optional CUDA backend that is about **1.7× faster than llama.cpp** on the test
+machine. GGUF files are memory-mapped, so loading a 4.8 GB model takes ~0.5 s.
 
 ### Features
 
 | Subsystem | What is implemented |
 |---|---|
-| GGUF v3 | Header, metadata and tensor descriptors; tensor data read lazily from the file |
+| GGUF v3 | Header, metadata and tensor descriptors; tensor data is memory-mapped (zero-copy) |
+| Architectures | LLaMA/Mistral/Qwen2-style transformers plus Gemma 4 (SWA/global layers, per-layer embeddings, shared KV, softcapping) |
 | Quantization | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — all dequantizers ported from the reference ggml C code |
 | Math | Unrolled `dot`, AVX/SSE4.1 SIMD fused kernels, RMSNorm, stable softmax, RoPE (LLaMA + NeoX), SwiGLU |
 | Transformer | LLaMA-style blocks, grouped-query attention, geometrically growing KV cache, Qwen attention biases |
@@ -68,6 +70,9 @@ cargo run --release --example generate -- \
 cargo run --release --example info -- model.gguf
 cargo run --release --example tokens -- model.gguf "Hello world"
 cargo run --release --example bench -- model.gguf "Once upon a time" 64 --threads 8
+
+# Gemma 4 (CPU)
+cargo run --release --example gemma4 -- gemma4.gguf "Hello" --max 32
 ```
 
 GPU:
@@ -115,6 +120,7 @@ src/
   tokenizer/bpe.rs   BPE and text normalization
   model/             config, attention kernels, KV cache, weights, forward pass
   cuda.rs            CUDA driver FFI, NVRTC JIT, GPU matvec
+  model/gemma4.rs    Gemma 4 architecture (SWA, per-layer embeddings, shared KV)
   sampler.rs         next-token sampling
   generate.rs        generation loop
   synthetic.rs       test-model generator
@@ -127,7 +133,7 @@ src/
 - CPU path is scalar/SIMD Rust: no GPU required, but slower than native C++.
 - CUDA path stores f32 weights in VRAM: a 7B model needs ~28 GB.
 - Exotic quantizations (IQ-*, TQ*) are not implemented.
-- Architectures outside LLaMA/Qwen2-style transformers (e.g. Gemma 4) are not supported.
+- Gemma 4 runs on CPU only; its CUDA path is not implemented (VRAM requirements exceed 8 GB).
 
 ### License
 
@@ -142,14 +148,17 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 токенизации — только `std`.
 
 Движок запускает GGUF-модели семейства LLaMA (LLaMA 2/3, Mistral, Qwen2,
-CodeLlama и др.), включая квантованные веса. Есть опциональный CUDA-бэкенд,
-который на тестовой машине **примерно в 1.7 раза быстрее llama.cpp**.
+CodeLlama и др.) и плотные текстовые модели **Gemma 4**, включая квантованные
+веса. GGUF-файлы отображаются в память через mmap, поэтому загрузка модели
+на 4.8 ГБ занимает ~0.5 с. Есть опциональный CUDA-бэкенд, который на тестовой
+машине **примерно в 1.7 раза быстрее llama.cpp**.
 
 ### Возможности
 
 | Подсистема | Что реализовано |
 |---|---|
-| GGUF v3 | Парсер заголовка, метаданных и дескрипторов; ленивое чтение данных из файла |
+| GGUF v3 | Парсер заголовка и метаданных; данные memory-mapped (без копирования) |
+| Архитектуры | Трансформеры LLaMA/Mistral/Qwen2 и Gemma 4 (SWA/global слои, per-layer embeddings, общий KV, softcapping) |
 | Квантование | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — деквантовщики портированы с эталонного C-кода ggml |
 | Математика | Развёрнутый `dot`, AVX/SSE4.1 SIMD-ядра, RMSNorm, стабильный softmax, RoPE (LLaMA и NeoX), SwiGLU |
 | Трансформер | Блоки LLaMA, grouped-query attention, KV-кэш с геометрическим ростом, attention-биасы Qwen |
@@ -195,6 +204,9 @@ cargo run --release --example generate -- \
 cargo run --release --example info -- model.gguf
 cargo run --release --example tokens -- model.gguf "Hello world"
 cargo run --release --example bench -- model.gguf "Once upon a time" 64 --threads 8
+
+# Gemma 4 (CPU)
+cargo run --release --example gemma4 -- gemma4.gguf "Hello" --max 32
 ```
 
 GPU:
@@ -240,6 +252,7 @@ src/
   tokenizer/bpe.rs   BPE и нормализация текста
   model/             конфиг, ядра attention, KV-кэш, веса, forward pass
   cuda.rs            FFI к CUDA Driver API, NVRTC JIT, GPU matvec
+  model/gemma4.rs    архитектура Gemma 4 (SWA, per-layer embeddings, общий KV)
   sampler.rs         выбор следующего токена
   generate.rs        цикл генерации
   synthetic.rs       генератор тестовой модели
@@ -252,7 +265,7 @@ src/
 - CPU-путь — скалярный/SIMD Rust: GPU не нужен, но скорость ниже, чем у C++.
 - CUDA-путь хранит f32-веса в VRAM: модель 7B требует ~28 ГБ.
 - Экзотические кванты (IQ-*, TQ*) не реализованы.
-- Архитектуры вне LLaMA/Qwen2-подобных трансформеров (например Gemma 4) не поддерживаются.
+- Gemma 4 работает только на CPU; CUDA-путь для неё не реализован (VRAM-требования больше 8 ГБ).
 
 ### Лицензия
 

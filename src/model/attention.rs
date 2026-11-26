@@ -6,9 +6,12 @@ use crate::Result;
 /// RMS normalization: `out[i] = w[i] * x[i] / sqrt(mean(x^2) + eps)`.
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<()> {
     if x.len() != w.len() || out.len() != x.len() {
-        return Err(crate::error::Error::ShapeMismatch(
-            "rmsnorm operand sizes differ".into(),
-        ));
+        return Err(crate::error::Error::ShapeMismatch(format!(
+            "rmsnorm operand sizes differ: x={}, w={}, out={}",
+            x.len(),
+            w.len(),
+            out.len()
+        )));
     }
     let ss = dot(x, x) / x.len() as f32;
     let scale = 1.0 / (ss + eps).sqrt();
