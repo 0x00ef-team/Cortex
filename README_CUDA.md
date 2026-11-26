@@ -46,11 +46,15 @@ cargo run --release --example generate -- model.gguf "Once upon a time" \
 
 cargo run --release --example bench -- model.gguf "Once upon a time" 64 --device cuda
 cargo run --release --example cuda_bench   # kernel smoke test and GPU/CPU comparison
+
+# Gemma 4 (quantized weights stay compressed in VRAM)
+cargo run --release --example gemma4 -- gemma4.gguf "Hello" --max 32 --cuda
 ```
 
-CUDA mode forces `DequantPolicy::Eager`: all matrices are dequantized to `f32`
-once and uploaded to VRAM at load time. If CUDA is unavailable, use
-`Device::Cpu` (the default).
+LLaMA/Qwen2 models use `DequantPolicy::Eager`: matrices are dequantized to
+`f32` once and uploaded to VRAM. Gemma 4 keeps weights quantized and
+dequantizes blocks inside GPU kernels, so a 4.8 GB Q4_K_XL file fits into 8 GB.
+If CUDA is unavailable, use `Device::Cpu` (the default).
 
 ## Implementation
 
@@ -65,9 +69,13 @@ once and uploaded to VRAM at load time. If CUDA is unavailable, use
 
 ### Limitations
 
-- Only `f32` weights in VRAM. A 7B model needs ~28 GB and will not fit into
-  8 GB; it requires GPU kernels for Q4_K/Q8_0 or weight streaming.
+- LLaMA/Qwen2 keep only `f32` weights in VRAM: a 7B model needs ~28 GB and will
+  not fit into 8 GB. Gemma 4 uses quantized GPU kernels instead, but its
+  attention/norms still run on CPU.
 - Single GPU (`Device::Cuda(0)`), no multi-GPU.
+- Gemma 4 is supported via on-the-fly GPU dequantization kernels for Q4_K,
+  Q5_K, Q6_K, Q8_0, F16 and F32 — weights stay compressed in VRAM (~4.8 GB),
+  so a 4B model fits into 8 GB. Attention/norms for Gemma 4 remain on CPU.
 - No CUDA Graphs: each `matvec` issues a memcpy, a launch, a sync and a copy
   back. Overlap across layers is future work.
 - Attention / KV cache are scalar on CPU.
@@ -80,6 +88,8 @@ once and uploaded to VRAM at load time. If CUDA is unavailable, use
 | Configuration | Throughput |
 |---|---|
 | **Cortex CUDA** | **~41–42 tok/s** |
+| Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
+| llama.cpp GPU, same Gemma 4 model | ~3 tok/s |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~10 tok/s |
 

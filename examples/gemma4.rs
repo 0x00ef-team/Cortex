@@ -21,12 +21,13 @@ fn main() -> Result<(), Error> {
         .find(|w| w[0] == "--max")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(32);
+    let cuda = args.iter().any(|a| a == "--cuda");
 
     let t0 = Instant::now();
     let gguf = GgufFile::load(path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     drop(gguf);
-    let mut model = Gemma4::load(path)?;
+    let mut model = Gemma4::load_with_device(path, if cuda { Some(0) } else { None })?;
     eprintln!("[gemma4] loaded in {:?}, {} layers", t0.elapsed(), model.config.n_layers);
 
     model.reset_cache();

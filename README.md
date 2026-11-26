@@ -133,7 +133,7 @@ src/
 - CPU path is scalar/SIMD Rust: no GPU required, but slower than native C++.
 - CUDA path stores f32 weights in VRAM: a 7B model needs ~28 GB.
 - Exotic quantizations (IQ-*, TQ*) are not implemented.
-- Gemma 4 runs on CPU only; its CUDA path is not implemented (VRAM requirements exceed 8 GB).
+- Gemma 4 CUDA uses on-the-fly dequantization kernels and keeps weights quantized in VRAM (~4.8 GB).
 
 ### License
 
@@ -265,7 +265,7 @@ src/
 - CPU-путь — скалярный/SIMD Rust: GPU не нужен, но скорость ниже, чем у C++.
 - CUDA-путь хранит f32-веса в VRAM: модель 7B требует ~28 ГБ.
 - Экзотические кванты (IQ-*, TQ*) не реализованы.
-- Gemma 4 работает только на CPU; CUDA-путь для неё не реализован (VRAM-требования больше 8 ГБ).
+- CUDA-путь Gemma 4 деквантует веса прямо на GPU и держит их в VRAM в квантованном виде (~4.8 ГБ).
 
 ### Лицензия
 

@@ -7,6 +7,9 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
+use crate::cuda::{CudaDevice, QuantBuffer};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
 use crate::model::attention::{rmsnorm, rotate_half, softmax};
@@ -233,10 +236,29 @@ impl Weights {
     }
 }
 
-/// Gemma 4 model ready for autoregressive decoding (CPU).
+struct GpuLayer {
+    wq: QuantBuffer,
+    wk: Option<QuantBuffer>,
+    wv: Option<QuantBuffer>,
+    wo: QuantBuffer,
+    gate: QuantBuffer,
+    up: QuantBuffer,
+    down: QuantBuffer,
+    inp_gate: QuantBuffer,
+    proj: QuantBuffer,
+}
+
+struct GpuWeights {
+    output: QuantBuffer,
+    layers: Vec<GpuLayer>,
+}
+
+/// Gemma 4 model ready for autoregressive decoding.
 pub struct Gemma4 {
     pub config: Gemma4Config,
     weights: Weights,
+    gpu: Option<Arc<CudaDevice>>,
+    gpu_weights: Option<GpuWeights>,
     cache: Vec<LayerCache>,
     cos_swa: Vec<f32>,
     sin_swa: Vec<f32>,
@@ -246,7 +268,12 @@ pub struct Gemma4 {
 
 impl Gemma4 {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let mut g = GgufFile::load(path)?;
+        Self::load_with_device(path, None)
+    }
+
+    /// Load with an optional CUDA device (`Some(0)` uses GPU 0 for matvec).
+    pub fn load_with_device(path: impl AsRef<Path>, device: Option<u32>) -> Result<Self> {
+        let mut g = GgufFile::load(path.as_ref())?;
         let vocab = g
             .get_u32("gemma4.vocab_size")
             .or_else(|| {
@@ -259,6 +286,51 @@ impl Gemma4 {
             as usize;
         let config = Gemma4Config::from_gguf(&g, vocab)?;
         let weights = Weights::load(&mut g, &config)?;
+
+        let (gpu, gpu_weights) = match device {
+            None => (None, None),
+            Some(idx) => {
+                let _ = idx; // single GPU for now
+                let dev = Arc::new(CudaDevice::new()?);
+                let upload = |name: &str| -> Result<QuantBuffer> {
+                    let info = g.info(name)?;
+                    let rows = info.rows();
+                    let cols = info.cols();
+                    let kind = info.kind;
+                    let (map, offset, len) = g.tensor_view(name)?;
+                    dev.upload_quant(kind, rows, cols, map.slice(offset, len)?)
+                };
+                let mut layers = Vec::with_capacity(config.n_layers);
+                for il in 0..config.n_layers {
+                    let p = |s: &str| format!("blk.{il}.{s}");
+                    layers.push(GpuLayer {
+                        wq: upload(&p("attn_q.weight"))?,
+                        wk: if g.info(&p("attn_k.weight")).is_ok() {
+                            Some(upload(&p("attn_k.weight"))?)
+                        } else {
+                            None
+                        },
+                        wv: if g.info(&p("attn_v.weight")).is_ok() {
+                            Some(upload(&p("attn_v.weight"))?)
+                        } else {
+                            None
+                        },
+                        wo: upload(&p("attn_output.weight"))?,
+                        gate: upload(&p("ffn_gate.weight"))?,
+                        up: upload(&p("ffn_up.weight"))?,
+                        down: upload(&p("ffn_down.weight"))?,
+                        inp_gate: upload(&p("inp_gate.weight"))?,
+                        proj: upload(&p("proj.weight"))?,
+                    });
+                }
+                let output = if g.info("output.weight").is_ok() {
+                    upload("output.weight")?
+                } else {
+                    upload("token_embd.weight")?
+                };
+                (Some(dev), Some(GpuWeights { output, layers }))
+            }
+        };
 
         let capacity = config.n_ctx.min(1024).max(64);
         let cache = (0..config.n_layers)
@@ -279,6 +351,8 @@ impl Gemma4 {
         Ok(Self {
             config,
             weights,
+            gpu,
+            gpu_weights,
             cache,
             cos_swa,
             sin_swa,
@@ -332,7 +406,15 @@ impl Gemma4 {
         }
 
         let weights = &self.weights;
+        let gpu = self.gpu.as_ref();
+        let gw = self.gpu_weights.as_ref();
         let cache = &mut self.cache;
+        let mv = |m: &Matrix, q: Option<&QuantBuffer>, x: &[f32], out: &mut [f32]| -> Result<()> {
+            match (gpu, q) {
+                (Some(d), Some(b)) => d.matvec_quant(b, x, out),
+                _ => m.matvec(x, out),
+            }
+        };
         let mut nbuf = vec![0f32; n];
         let mut normed = vec![0f32; n];
         let mut q = vec![0f32; 0];
@@ -361,10 +443,11 @@ impl Gemma4 {
                 (&self.cos_g[pos * half..(pos + 1) * half], &self.sin_g[pos * half..(pos + 1) * half])
             };
 
+            let gl = gw.map(|g| &g.layers[il]);
             lw.attn_norm.row(0, &mut nbuf)?;
             rmsnorm(&x, &nbuf, cfg.eps, &mut normed)?;
             q.resize(q_dim, 0.0);
-            lw.wq.matvec(&normed, &mut q)?;
+            mv(&lw.wq, gl.map(|g| &g.wq), &normed, &mut q)?;
             // per-head Q norm
             let mut qnorm_w = vec![0f32; hd];
             lw.q_norm.row(0, &mut qnorm_w)?;
@@ -381,12 +464,13 @@ impl Gemma4 {
             if cfg.has_kv(il) {
                 k.resize(kv_dim, 0.0);
                 v.resize(kv_dim, 0.0);
-                lw.wk
+                let wk = lw
+                    .wk
                     .as_ref()
-                    .ok_or_else(|| Error::MissingTensor(format!("blk.{il}.attn_k.weight")))?
-                    .matvec(&normed, &mut k)?;
+                    .ok_or_else(|| Error::MissingTensor(format!("blk.{il}.attn_k.weight")))?;
+                mv(wk, gl.and_then(|g| g.wk.as_ref()), &normed, &mut k)?;
                 match &lw.wv {
-                    Some(w) => w.matvec(&normed, &mut v)?,
+                    Some(w) => mv(w, gl.and_then(|g| g.wv.as_ref()), &normed, &mut v)?,
                     None => v.copy_from_slice(&k),
                 }
                 if let Some(kn) = &lw.k_norm {
@@ -434,25 +518,25 @@ impl Gemma4 {
                 }
             }
             o.resize(n, 0.0);
-            lw.wo.matvec(&attn, &mut o)?;
+            mv(&lw.wo, gl.map(|g| &g.wo), &attn, &mut o)?;
             lw.attn_post_norm.row(0, &mut nbuf)?;
             rmsnorm(&o, &nbuf, cfg.eps, &mut normed)?;
             let attn_out: Vec<f32> = normed.iter().zip(&x).map(|(a, b)| a + b).collect();
 
             lw.ffn_norm.row(0, &mut nbuf)?;
             rmsnorm(&attn_out, &nbuf, cfg.eps, &mut normed)?;
-            lw.w_gate.matvec(&normed, &mut gate)?;
-            lw.w_up.matvec(&normed, &mut up)?;
+            mv(&lw.w_gate, gl.map(|g| &g.gate), &normed, &mut gate)?;
+            mv(&lw.w_up, gl.map(|g| &g.up), &normed, &mut up)?;
             for i in 0..cfg.n_ffn {
                 act[i] = gelu(gate[i]) * up[i];
             }
-            lw.w_down.matvec(&act, &mut ffn)?;
+            mv(&lw.w_down, gl.map(|g| &g.down), &act, &mut ffn)?;
             lw.ffn_post_norm.row(0, &mut nbuf)?;
             rmsnorm(&ffn, &nbuf, cfg.eps, &mut normed)?;
             let mut cur: Vec<f32> = normed.iter().zip(&attn_out).map(|(a, b)| a + b).collect();
 
             // Per-layer embedding (PLE)
-            lw.inp_gate.matvec(&cur, &mut ple_gate)?;
+            mv(&lw.inp_gate, gl.map(|g| &g.inp_gate), &cur, &mut ple_gate)?;
             for z in &mut ple_gate {
                 *z = gelu(*z);
             }
@@ -460,7 +544,7 @@ impl Gemma4 {
             for j in 0..cfg.n_embd_per_layer {
                 ple_gate[j] *= ple_token[off + j];
             }
-            lw.proj.matvec(&ple_gate, &mut ple_out)?;
+            mv(&lw.proj, gl.map(|g| &g.proj), &ple_gate, &mut ple_out)?;
             lw.post_norm.row(0, &mut nbuf)?;
             rmsnorm(&ple_out, &nbuf, cfg.eps, &mut ple_normed)?;
             for j in 0..n {
@@ -473,7 +557,12 @@ impl Gemma4 {
         weights.output_norm.row(0, &mut nbuf)?;
         rmsnorm(&x, &nbuf, cfg.eps, &mut normed)?;
         let mut logits = vec![0f32; cfg.vocab];
-        weights.output.matvec(&normed, &mut logits)?;
+        mv(
+            &weights.output,
+            gw.map(|g| &g.output),
+            &normed,
+            &mut logits,
+        )?;
         if cfg.softcap > 0.0 {
             for v in &mut logits {
                 *v = (*v / cfg.softcap).tanh() * cfg.softcap;

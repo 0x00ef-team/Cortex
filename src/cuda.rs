@@ -114,6 +114,176 @@ extern "C" __global__ void matvec_tall(
     if (tid == 0) y[r] = partial[0];
 }
 
+// ---- Quantized matvec kernels: dequantize blocks on the fly ----
+
+__device__ __forceinline__ float cortex_h2f(unsigned short h) {
+    unsigned int sign = (h >> 15) & 1u;
+    unsigned int exp  = (h >> 10) & 31u;
+    unsigned int mant = h & 1023u;
+    unsigned int bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign << 31;
+        else {
+            int e = -14;
+            unsigned int m = mant;
+            while ((m & 1024u) == 0) { m <<= 1; --e; }
+            bits = (sign << 31) | ((unsigned int)(e + 127) << 23) | ((m & 1023u) << 13);
+        }
+    } else if (exp == 31) {
+        bits = (sign << 31) | 0x7f800000u | (mant << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return __int_as_float((int) bits);
+}
+
+__device__ __forceinline__ unsigned short ld16(const unsigned char* p) {
+    return (unsigned short) p[0] | ((unsigned short) p[1] << 8);
+}
+
+__device__ __forceinline__ void get_sm_k4(int j, const unsigned char* q, int* s, int* m) {
+    if (j < 4) { *s = q[j] & 63; *m = q[j + 4] & 63; }
+    else {
+        *s = (q[j + 4] & 15) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void matvec_q4_k(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = W + (size_t) r * ((cols / 256) * 144);
+    float sum = 0.f;
+    int c = 0;
+    for (int b = 0; b < cols / 256; ++b) {
+        const unsigned char* blk = row + b * 144;
+        float d = cortex_h2f(ld16(blk));
+        float dm = cortex_h2f(ld16(blk + 2));
+        const unsigned char* sc = blk + 4;
+        const unsigned char* q = blk + 16;
+        int is = 0;
+        for (int j = 0; j < 4; ++j) {
+            int s1, m1, s2, m2;
+            get_sm_k4(is, sc, &s1, &m1);
+            get_sm_k4(is + 1, sc, &s2, &m2);
+            float d1 = d * s1, m1f = dm * m1;
+            float d2 = d * s2, m2f = dm * m2;
+            for (int l = 0; l < 32; ++l) {
+                sum += (d1 * (q[l] & 15) - m1f) * x[c + l];
+                sum += (d2 * (q[l] >> 4) - m2f) * x[c + 32 + l];
+            }
+            q += 32; is += 2; c += 64;
+        }
+    }
+    y[r] = sum;
+}
+
+extern "C" __global__ void matvec_q6_k(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = W + (size_t) r * ((cols / 256) * 210);
+    float sum = 0.f;
+    int c = 0;
+    for (int b = 0; b < cols / 256; ++b) {
+        const unsigned char* blk = row + b * 210;
+        float d = cortex_h2f(ld16(blk + 208));
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const signed char* sc = (const signed char*) (blk + 192);
+        for (int n = 0; n < 2; ++n) {
+            const unsigned char* l = ql + n * 64;
+            const unsigned char* h = qh + n * 32;
+            const signed char* s = sc + n * 8;
+            for (int i = 0; i < 32; ++i) {
+                int is = i / 16;
+                float q1 = (float)(int)((signed char)((l[i] & 15) | ((h[i] & 3) << 4)) - 32);
+                float q2 = (float)(int)((signed char)((l[i + 32] & 15) | (((h[i] >> 2) & 3) << 4)) - 32);
+                float q3 = (float)(int)((signed char)((l[i] >> 4) | (((h[i] >> 4) & 3) << 4)) - 32);
+                float q4 = (float)(int)((signed char)((l[i + 32] >> 4) | (((h[i] >> 6) & 3) << 4)) - 32);
+                sum += d * s[is]     * q1 * x[c + i];
+                sum += d * s[is + 2] * q2 * x[c + i + 32];
+                sum += d * s[is + 4] * q3 * x[c + i + 64];
+                sum += d * s[is + 6] * q4 * x[c + i + 96];
+            }
+            c += 128;
+        }
+    }
+    y[r] = sum;
+}
+
+extern "C" __global__ void matvec_q5_k(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = W + (size_t) r * ((cols / 256) * 176);
+    float sum = 0.f;
+    int c = 0;
+    for (int b = 0; b < cols / 256; ++b) {
+        const unsigned char* blk = row + b * 176;
+        float d = cortex_h2f(ld16(blk));
+        float dm = cortex_h2f(ld16(blk + 2));
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qh = blk + 16;
+        const unsigned char* ql = blk + 48;
+        int is = 0;
+        unsigned int u1 = 1u, u2 = 2u;
+        for (int j = 0; j < 4; ++j) {
+            int s1, m1, s2, m2;
+            get_sm_k4(is, sc, &s1, &m1);
+            get_sm_k4(is + 1, sc, &s2, &m2);
+            float d1 = d * s1, m1f = dm * m1;
+            float d2 = d * s2, m2f = dm * m2;
+            for (int l = 0; l < 32; ++l) {
+                float q1 = (float)((ql[l] & 15) | ((qh[l] & u1) ? 16 : 0));
+                float q2 = (float)((ql[l] >> 4) | ((qh[l] & u2) ? 16 : 0));
+                sum += (d1 * q1 - m1f) * x[c + l];
+                sum += (d2 * q2 - m2f) * x[c + 32 + l];
+            }
+            ql += 32; is += 2; c += 64;
+            u1 <<= 2; u2 <<= 2;
+        }
+    }
+    y[r] = sum;
+}
+
+extern "C" __global__ void matvec_q8_0(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = W + (size_t) r * ((cols / 32) * 34);
+    float sum = 0.f;
+    for (int b = 0; b < cols / 32; ++b) {
+        const unsigned char* blk = row + b * 34;
+        float d = cortex_h2f(ld16(blk));
+        for (int l = 0; l < 32; ++l) {
+            sum += ((signed char) blk[2 + l]) * d * x[b * 32 + l];
+        }
+    }
+    y[r] = sum;
+}
+
+extern "C" __global__ void matvec_f16(
+    const unsigned short* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned short* row = W + (size_t) r * cols;
+    float sum = 0.f;
+    for (int c = 0; c < cols; ++c) sum += cortex_h2f(row[c]) * x[c];
+    y[r] = sum;
+}
+
 extern "C" __global__ void swiglu_kernel(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -144,9 +314,22 @@ impl Drop for CudaBuffer {
 // is process-wide; multiple devices are not supported (see README_CUDA).
 static mut LETS_FREE: fn(u64) = |_| {};
 
+/// Quantized weight matrix stored in device memory.
+pub struct QuantBuffer {
+    ptr: u64,
+    pub kind: u32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 struct Api {
     function: u64,
     tall: u64,
+    q4k: u64,
+    q6k: u64,
+    q5k: u64,
+    q8_0: u64,
+    f16: u64,
     swiglu: u64,
     cu_mem_alloc: CuMemAlloc,
     cu_memcpy_h2d: CuMemcpyHtoD,
@@ -255,6 +438,21 @@ impl CudaDevice {
             let tname = CString::new("matvec_tall").unwrap();
             let mut tall = 0u64;
             check(cu_module_fn(&mut tall, module, tname.as_ptr()), "cuModuleGetFunction(tall)")?;
+            let mut kq4 = 0u64;
+            let n = CString::new("matvec_q4_k").unwrap();
+            check(cu_module_fn(&mut kq4, module, n.as_ptr()), "fn q4k")?;
+            let mut kq6 = 0u64;
+            let n = CString::new("matvec_q6_k").unwrap();
+            check(cu_module_fn(&mut kq6, module, n.as_ptr()), "fn q6k")?;
+            let mut kq5 = 0u64;
+            let n = CString::new("matvec_q5_k").unwrap();
+            check(cu_module_fn(&mut kq5, module, n.as_ptr()), "fn q5k")?;
+            let mut kq8 = 0u64;
+            let n = CString::new("matvec_q8_0").unwrap();
+            check(cu_module_fn(&mut kq8, module, n.as_ptr()), "fn q8_0")?;
+            let mut kf16 = 0u64;
+            let n = CString::new("matvec_f16").unwrap();
+            check(cu_module_fn(&mut kf16, module, n.as_ptr()), "fn f16")?;
             let swname = CString::new("swiglu_kernel").unwrap();
             let mut swiglu = 0u64;
             check(cu_module_fn(&mut swiglu, module, swname.as_ptr()), "cuModuleGetFunction(swiglu)")?;
@@ -265,6 +463,11 @@ impl CudaDevice {
                 api: Arc::new(Api {
                     function,
                     tall,
+                    q4k: kq4,
+                    q6k: kq6,
+                    q5k: kq5,
+                    q8_0: kq8,
+                    f16: kf16,
                     swiglu,
                     cu_mem_alloc,
                     cu_memcpy_h2d,
@@ -448,6 +651,94 @@ impl CudaDevice {
                     std::ptr::null_mut(),
                 ),
                 "cuLaunchKernel(tall)",
+            )?;
+            check((self.api.cu_sync)(), "cuCtxSynchronize")?;
+            check(
+                (self.api.cu_memcpy_d2h)(out.as_mut_ptr() as *mut c_void, y_ptr, out.len() * 4),
+                "cuMemcpyDtoH",
+            )?;
+        }
+        let elapsed = started.elapsed().as_nanos() as u64;
+        self.matvec_ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Upload raw quantized tensor bytes to VRAM.
+    pub fn upload_quant(
+        &self,
+        kind: u32,
+        rows: usize,
+        cols: usize,
+        data: &[u8],
+    ) -> Result<QuantBuffer> {
+        let mut ptr = 0u64;
+        unsafe {
+            check(
+                (self.api.cu_mem_alloc)(&mut ptr, data.len()),
+                "cuMemAlloc(quant)",
+            )?;
+            check(
+                (self.api.cu_memcpy_h2d)(ptr, data.as_ptr() as *const c_void, data.len()),
+                "cuMemcpyHtoD(quant)",
+            )?;
+        }
+        Ok(QuantBuffer { ptr, kind, rows, cols })
+    }
+
+    /// `out = quantized_weight * x`, dequantizing each block on the GPU.
+    pub fn matvec_quant(&self, w: &QuantBuffer, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let func = match w.kind {
+            12 => self.api.q4k,
+            14 => self.api.q6k,
+            13 => self.api.q5k,
+            8 => self.api.q8_0,
+            0 => self.api.function,
+            1 => self.api.f16,
+            other => {
+                return Err(Error::InvalidConfig(format!(
+                    "CUDA: unsupported quantization type {other}"
+                )))
+            }
+        };
+        let started = Instant::now();
+        let mut cache = self.scratch.lock().unwrap();
+        let xkey = (x.len(), 0usize);
+        let xbufs = cache.entry(xkey).or_default();
+        if xbufs.is_empty() {
+            xbufs.push(self.upload(&vec![0.0f32; x.len()])?);
+        }
+        let x_ptr = xbufs[0].ptr;
+        let ykey = (x.len(), w.rows);
+        let ybufs = cache.entry(ykey).or_default();
+        if ybufs.is_empty() {
+            ybufs.push(self.upload(&vec![0.0f32; w.rows])?);
+        }
+        let y_ptr = ybufs[0].ptr;
+        unsafe {
+            check(
+                (self.api.cu_memcpy_h2d)(x_ptr, x.as_ptr() as *const c_void, x.len() * 4),
+                "cuMemcpyHtoD(x)",
+            )?;
+            let rows = w.rows as i32;
+            let cols = w.cols as i32;
+            let mut params: [*mut c_void; 5] = [
+                &w.ptr as *const u64 as *mut c_void,
+                &x_ptr as *const u64 as *mut c_void,
+                &y_ptr as *const u64 as *mut c_void,
+                &rows as *const i32 as *mut c_void,
+                &cols as *const i32 as *mut c_void,
+            ];
+            check(
+                (self.api.cu_launch)(
+                    func,
+                    (w.rows as u32).div_ceil(256),
+                    1, 1, 256, 1, 1, 0,
+                    std::ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel(quant)",
             )?;
             check((self.api.cu_sync)(), "cuCtxSynchronize")?;
             check(
