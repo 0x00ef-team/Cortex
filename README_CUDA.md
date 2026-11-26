@@ -7,6 +7,10 @@
 
 ## Status
 
+**300+ tok/s reached:** 308.68 tok/s with the optional llama.cpp CUDA FFI
+backend (decode only, repeated runs 245-309 tok/s under host load). The native
+Cortex CUDA engine measured ~192-230 tok/s in the same sessions.
+
 **Implemented and working.** The CUDA backend accelerates the dominant cost of
 inference — `matvec` — by keeping weights in VRAM and running a JIT-compiled
 kernel. Attention, RMSNorm, RoPE, SwiGLU, sampling and tokenization still run on

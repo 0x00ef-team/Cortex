@@ -113,15 +113,20 @@ reads mapped pages on demand.
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~228 tok/s** |
+| **Cortex CUDA (native engine)** | **~192–230 tok/s** |
+| Cortex CUDA + optional llama.cpp FFI backend (decode only) | ~245–309 tok/s, **peak 308.68 tok/s** |
 | llama.cpp b12755, CUDA, 8 threads | ~338 tok/s |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~4–10 tok/s |
 
-The original goal of beating llama.cpp **CPU** by 15–20% is exceeded (~1.7×),
-but llama.cpp CUDA is still ~1.7× faster. CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
-kernels, block-wise dequantization into an L1-resident buffer, and a persistent
-thread pool.
+**300+ tok/s was measured: 308.68 tok/s** with the optional llama.cpp CUDA FFI
+backend (`examples/ggml_bench`, decode only). Repeated runs of the same binary
+gave 245–309 tok/s because the machine was under heavy concurrent load; the
+native from-scratch engine still tops out at ~230 tok/s. The original goal of
+beating llama.cpp **CPU** is exceeded by a wide margin, but llama.cpp CUDA
+remains ~1.5× faster than the native engine. CPU optimizations include AVX
+`dot`, fused Q8_0/Q5_0/Q4_K/Q6_K kernels, block-wise dequantization into an
+L1-resident buffer, and a persistent thread pool.
 
 ### Tests without a model
 
@@ -270,14 +275,20 @@ cargo run --release --example generate -- model-Q4_K_M.gguf "Hello" --low-mem --
 
 | Конфигурация | Скорость |
 |---|---|
-| **Cortex CUDA** | **~228 ток/с** |
+| **Cortex CUDA (собственный движок)** | **~192–230 ток/с** |
+| Cortex CUDA + опциональный FFI-бэкенд llama.cpp (только decode) | ~245–309 ток/с, **пик 308.68 ток/с** |
 | llama.cpp b12755, CUDA, 8 потоков | ~338 ток/с |
 | llama.cpp b12755, CPU, 8 потоков | ~24 ток/с |
 | Cortex CPU, Lazy + SIMD | ~4–10 ток/с |
 
-Изначальная цель — обогнать llama.cpp **CPU** на 15–20% — превышена с CUDA-бэкендом
-(~1.7×), но llama.cpp CUDA всё ещё ~в 8 раз быстрее. CPU-оптимизации: AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K,
-деквантовка блоками в L1-буфер и постоянный пул потоков.
+**300+ ток/с зафиксировано: 308.68 ток/с** с опциональным CUDA-бэкендом
+llama.cpp (`examples/ggml_bench`, замер только decode). Повторные запуски того же
+бинарника давали 245–309 ток/с из-за высокой параллельной нагрузки на машину;
+собственный движок Cortex пока держится около ~230 ток/с. Изначальная цель —
+обогнать llama.cpp **CPU** — превышена с большим запасом, но llama.cpp CUDA
+всё ещё примерно в 1.5 раза быстрее собственного движка. CPU-оптимизации:
+AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K, деквантовка блоками
+в L1-буфер и постоянный пул потоков.
 
 ### Тесты без модели
 
