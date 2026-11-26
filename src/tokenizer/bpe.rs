@@ -29,6 +29,8 @@ pub struct Tokenizer {
     lookup: HashMap<Vec<u8>, u32>,
     /// GPT-2 style explicit merge list: concatenation -> priority (lower first).
     merge_ranks: HashMap<Vec<u8>, usize>,
+    /// Packed `(left_id << 32) | right_id` -> (result_id, merge_rank).
+    pair_ranks: HashMap<u64, (u32, usize)>,
     pub bos: u32,
     pub eos: u32,
     pub unk: u32,
@@ -125,6 +127,7 @@ impl Tokenizer {
         // Qwen/GPT-2 vocabularies carry an explicit, ordered merge list
         // instead of scores. Earlier merges have higher priority.
         let mut merge_ranks = HashMap::new();
+        let mut pair_ranks = HashMap::new();
         if let Some(merges) = m
             .get("tokenizer.ggml.merges")
             .and_then(Value::as_array)
@@ -132,9 +135,17 @@ impl Tokenizer {
             for (rank, item) in merges.iter().enumerate() {
                 let Some(s) = item.bytes() else { continue };
                 let Some(sep) = s.iter().position(|&b| b == b' ') else { continue };
-                let mut pair = s[..sep].to_vec();
-                pair.extend_from_slice(&s[sep + 1..]);
-                merge_ranks.entry(pair).or_insert(rank);
+                let left = &s[..sep];
+                let right = &s[sep + 1..];
+                let mut pair = left.to_vec();
+                pair.extend_from_slice(right);
+                merge_ranks.entry(pair.clone()).or_insert(rank);
+                if let (Some(&li), Some(&ri), Some(&ni)) = (
+                    lookup.get(left), lookup.get(right), lookup.get(&pair),
+                ) {
+                    let key = ((li as u64) << 32) | ri as u64;
+                    pair_ranks.entry(key).or_insert((ni, rank));
+                }
             }
         }
 
@@ -145,6 +156,7 @@ impl Tokenizer {
             scores,
             lookup,
             merge_ranks,
+            pair_ranks,
             bos,
             eos,
             unk,
@@ -247,13 +259,24 @@ impl Tokenizer {
             .map(|s| *self.lookup.get(s).unwrap_or(&self.unk))
             .collect();
 
+        let use_pairs = !self.pair_ranks.is_empty();
         loop {
             let mut best: Option<(usize, f32, usize, u32)> = None;
             for i in 0..ids.len().saturating_sub(1) {
-                let mut merged = self.tokens[ids[i] as usize].clone();
-                merged.extend_from_slice(&self.tokens[ids[i + 1] as usize]);
-                if let Some(&new_id) = self.lookup.get(&merged) {
-                    let rank = self.merge_ranks.get(&merged).copied().unwrap_or(usize::MAX);
+                let (new_id, rank) = if use_pairs {
+                    let key = ((ids[i] as u64) << 32) | ids[i + 1] as u64;
+                    match self.pair_ranks.get(&key) {
+                        Some(&(id, r)) => (id, r),
+                        None => continue,
+                    }
+                } else {
+                    let mut merged = self.tokens[ids[i] as usize].clone();
+                    merged.extend_from_slice(&self.tokens[ids[i + 1] as usize]);
+                    let id = match self.lookup.get(&merged) { Some(&id) => id, None => continue };
+                    let r = self.merge_ranks.get(&merged).copied().unwrap_or(usize::MAX);
+                    (id, r)
+                };
+                {
                     let score = self.scores[new_id as usize];
                     let better = match best {
                         None => true,
@@ -414,6 +437,7 @@ mod tests {
             scores: vec![0.0, 0.0, 10.0],
             lookup: HashMap::new(),
             merge_ranks: HashMap::new(),
+            pair_ranks: HashMap::new(),
             bos: 0,
             eos: 1,
             unk: 0,

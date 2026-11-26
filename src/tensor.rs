@@ -301,8 +301,18 @@ impl Matrix {
         if pool.len() <= 1 || self.rows < 256 {
             return self.matvec_range(x, out, 0, self.rows);
         }
-        // Give each worker at least 128 rows; extra threads only add sync overhead.
-        let tasks = pool.len().min(self.rows.div_ceil(128)).max(1);
+        // Memory-bound: use fewer workers once the matrix stops fitting in
+        // cache. On this machine 8 SMT threads lose to 4 physical cores for
+        // the huge vocabulary head.
+        let bytes = self.rows * row_bytes(self.kind(), self.cols);
+        let wanted = if bytes < 256 * 1024 {
+            1
+        } else if bytes > 64 * 1024 * 1024 {
+            pool.physical()
+        } else {
+            pool.len()
+        };
+        let tasks = wanted.min(pool.len()).min(self.rows).max(1);
         let chunk = self.rows.div_ceil(tasks);
         let m_ptr = self as *const Matrix as usize;
         let x_ptr = x.as_ptr() as usize;

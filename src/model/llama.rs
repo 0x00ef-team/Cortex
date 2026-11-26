@@ -217,7 +217,6 @@ impl Llama {
         let mut act = vec![0.0f32; cfg.n_ffn];
         let mut down = vec![0.0f32; cfg.n_embd];
         let mut norm_buf = vec![0.0f32; cfg.n_embd];
-        let mut scores = vec![0.0f32; pos + 1];
 
         let cos = &self.cos[pos * half..(pos + 1) * half];
         let sin = &self.sin[pos * half..(pos + 1) * half];
@@ -278,21 +277,30 @@ impl Llama {
             }
             cache[li].append(pos, &k, &v);
 
+            // Online softmax (flash-style): keep m/l/accumulator in registers
+            // instead of materializing a score vector and doing a second pass.
             for h in 0..n_heads {
                 let kv_head = h / kv_mul;
                 let qh = &q[h * hd..(h + 1) * hd];
-                for t in 0..=pos {
-                    scores[t] = dot(qh, cache[li].key(t, kv_head, hd)) * scale;
-                }
-                softmax(&mut scores);
                 let ah = &mut attn[h * hd..(h + 1) * hd];
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
                 ah.fill(0.0);
                 for t in 0..=pos {
-                    let a = scores[t];
+                    let s = dot(qh, cache[li].key(t, kv_head, hd)) * scale;
+                    let mn = m.max(s);
+                    let a = (m - mn).exp();
+                    let p = (s - mn).exp();
+                    l = l * a + p;
                     let vh = cache[li].value(t, kv_head, hd);
                     for d in 0..hd {
-                        ah[d] += a * vh[d];
+                        ah[d] = ah[d] * a + p * vh[d];
                     }
+                    m = mn;
+                }
+                let inv = 1.0 / l.max(1e-20);
+                for d in 0..hd {
+                    ah[d] *= inv;
                 }
             }
 

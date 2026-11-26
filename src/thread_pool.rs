@@ -19,6 +19,38 @@ struct Job {
 pub struct ThreadPool {
     senders: Vec<Sender<Job>>,
     _workers: Vec<JoinHandle<()>>,
+    physical: usize,
+}
+
+extern "C" {
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+}
+
+/// Best-effort physical core count from /proc/cpuinfo.
+fn physical_cores(logical: usize) -> usize {
+    let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") else { return logical };
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("cpu cores") {
+            if let Some(v) = rest.split(':').nth(1) {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    return n.max(1).min(logical);
+                }
+            }
+        }
+    }
+    logical
+}
+
+/// Pin worker `idx` to a distinct physical core when possible: interleave
+/// logical CPUs so the first N workers avoid SMT siblings.
+fn pin_worker(idx: usize, logical: usize) {
+    let order: Vec<usize> = (0..logical).step_by(2).chain((1..logical).step_by(2)).collect();
+    let cpu = order[idx.min(order.len().saturating_sub(1))];
+    let mut mask = [0u8; 128];
+    mask[cpu / 8] = 1 << (cpu % 8);
+    unsafe {
+        sched_setaffinity(0, mask.len(), mask.as_ptr());
+    }
 }
 
 impl ThreadPool {
@@ -26,19 +58,28 @@ impl ThreadPool {
         let threads = threads.max(1);
         let mut senders = Vec::with_capacity(threads);
         let mut workers = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        let physical = physical_cores(threads);
+        for i in 0..threads {
             let (tx, rx): (Sender<Job>, Receiver<Job>) = mpsc::channel();
             senders.push(tx);
-            workers.push(thread::spawn(move || worker(rx)));
+            workers.push(thread::spawn(move || {
+                pin_worker(i, threads);
+                worker(rx)
+            }));
         }
         Self {
             senders,
             _workers: workers,
+            physical,
         }
     }
 
     pub fn len(&self) -> usize {
         self.senders.len()
+    }
+
+    pub fn physical(&self) -> usize {
+        self.physical
     }
 
     /// Run `count` indexed jobs in parallel and wait for all of them.
