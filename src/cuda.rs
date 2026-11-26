@@ -47,7 +47,7 @@ type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
 type CuStreamCreate = unsafe extern "C" fn(*mut u64, u32) -> i32;
 type CuStreamBeginCapture = unsafe extern "C" fn(u64, u32) -> i32;
 type CuStreamEndCapture = unsafe extern "C" fn(u64, *mut u64) -> i32;
-type CuGraphInstantiate = unsafe extern "C" fn(*mut u64, u64, *mut u64, *mut c_char, usize) -> i32;
+type CuGraphInstantiate = unsafe extern "C" fn(*mut u64, u64, *mut u64, *mut c_char, usize, u32) -> i32;
 type CuGraphLaunch = unsafe extern "C" fn(u64, u64) -> i32;
 type CuStreamSynchronize = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoDAsync = unsafe extern "C" fn(u64, *const c_void, usize, u64) -> i32;
@@ -394,12 +394,16 @@ extern "C" extern "C" __global__ void matvec_f16_rows(
     int lane = threadIdx.x & 31;
     const unsigned short* row = W + (size_t) r * cols;
     float sum = 0.f;
-    for (int c = lane * 2; c + 2 <= cols; c += 64) {
-        float2 wv = __half22float2(*(const __half2*) (row + c));
-        float2 xv = *(const float2*) (x + c);
-        sum += wv.x * xv.x + wv.y * xv.y;
+    for (int c = lane * 4; c + 4 <= cols; c += 128) {
+        float2 w0 = __half22float2(*(const __half2*) (row + c));
+        float2 w1 = __half22float2(*(const __half2*) (row + c + 2));
+        float2 x0 = *(const float2*) (x + c);
+        float2 x1 = *(const float2*) (x + c + 2);
+        sum += w0.x * x0.x + w0.y * x0.y + w1.x * x1.x + w1.y * x1.y;
     }
-    if (cols % 2 != 0 && lane == 0) sum += __half2float(__ushort_as_half(row[cols - 1])) * x[cols - 1];
+    for (int c = (cols / 4) * 4 + lane; c < cols; c += 32) {
+        sum += __half2float(__ushort_as_half(row[c])) * x[c];
+    }
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
     if (lane == 0) y[r] = sum;
 }
@@ -639,7 +643,7 @@ impl CudaDevice {
             let cu_stream_create: CuStreamCreate = ffi!(cuda, "cuStreamCreate", CuStreamCreate);
             let cu_begin: CuStreamBeginCapture = ffi!(cuda, "cuStreamBeginCapture", CuStreamBeginCapture);
             let cu_end: CuStreamEndCapture = ffi!(cuda, "cuStreamEndCapture", CuStreamEndCapture);
-            let cu_graph_inst: CuGraphInstantiate = ffi!(cuda, "cuGraphInstantiate", CuGraphInstantiate);
+            let cu_graph_inst: CuGraphInstantiate = ffi!(cuda, "cuGraphInstantiate_v2", CuGraphInstantiate);
             let cu_graph_launch: CuGraphLaunch = ffi!(cuda, "cuGraphLaunch", CuGraphLaunch);
             let cu_stream_sync: CuStreamSynchronize = ffi!(cuda, "cuStreamSynchronize", CuStreamSynchronize);
             let cu_memcpy_async: CuMemcpyHtoDAsync = ffi!(cuda, "cuMemcpyHtoDAsync_v2", CuMemcpyHtoDAsync);
@@ -860,7 +864,7 @@ impl CudaDevice {
             check((self.api.end)(self.api.stream, &mut graph), "cuStreamEndCapture")?;
             let mut exec = 0u64;
             check(
-                (self.api.graph_inst)(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                (self.api.graph_inst)(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
                 "cuGraphInstantiate",
             )?;
             *self.api.graph.lock().unwrap() = Some(exec);
