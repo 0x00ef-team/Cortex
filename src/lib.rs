@@ -27,6 +27,7 @@
 pub mod cuda;
 pub mod error;
 pub mod generate;
+pub mod ggml;
 pub mod gguf;
 pub mod model;
 pub mod quant;

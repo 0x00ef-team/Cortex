@@ -184,3 +184,20 @@ CUDA Graph replay initially produced wrong logits for two reasons: all
 another stream (empty graph), and the layer loop was still executed on replay
 (racing with the graph). Both fixed; capture mode is `0` and scalar kernel
 arguments use stable heap slots.
+
+### llama.cpp CUDA FFI backend (Nov 26)
+
+Decode only, 256-512 tokens, RTX 2060 SUPER, Qwen2.5-0.5B Q4_K_M:
+
+| Run | tok/s |
+|---|---|
+| 1 | 258.64 |
+| 2 | 308.68 |
+| 3 | 245.33 |
+| 4 (512 tokens) | 292.47 |
+| 5 (512 tokens) | 252.90 |
+
+The machine was under heavy concurrent load (Minecraft using ~4 CPU cores and
+the GPU), hence the spread. The native Cortex CUDA engine measured 192-230
+tok/s in the same sessions. `CORTEX_GGML_DIR` must point to a built llama.cpp
+`bin` directory; the backend is loaded with `dlopen` at runtime.

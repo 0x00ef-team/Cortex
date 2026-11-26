@@ -95,6 +95,16 @@ def tool_parity(args):
     )
 
 
+def tool_ggml_bench(args):
+    """Benchmark the optional llama.cpp CUDA FFI backend."""
+    model = args.get("model", DEFAULT_MODEL)
+    n = int(args.get("n", 128))
+    context = int(args.get("context", 1024))
+    cmd = [str(ROOT / "target/release/examples/ggml_bench"), model,
+           args.get("prompt", "Once upon a time"), str(n), str(context)]
+    return run(cmd, timeout=1200)
+
+
 TOOLS = {
     "cortex_status": ("Repository status and HEAD", {}, tool_status),
     "cortex_test": ("Run cargo test", {}, tool_test),
@@ -106,6 +116,11 @@ TOOLS = {
             "device": "string", "threads": "integer", "graph": "boolean",
         },
         tool_bench,
+    ),
+    "cortex_ggml_bench": (
+        "Benchmark decode throughput via llama.cpp CUDA FFI (opt-in backend).",
+        {"model": "string", "prompt": "string", "n": "integer", "context": "integer"},
+        tool_ggml_bench,
     ),
     "cortex_parity": (
         "Compare greedy CPU vs CUDA output for identical prompt/tokens.",

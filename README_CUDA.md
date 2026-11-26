@@ -109,6 +109,31 @@ measured against the CPU build only. The remaining GPU gap is launch overhead
 Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
 kernel moved Cortex from ~36 to ~228 tok/s.
 
+## Optional llama.cpp CUDA FFI backend
+
+`src/ggml.rs` can load a prebuilt `libllama.so.1` at runtime (`dlopen`, no Rust
+dependencies) and use its tuned CUDA kernels. This is **not** the from-scratch
+engine - it is an opt-in path for comparing against / using upstream kernels.
+Set `CORTEX_GGML_DIR` to the directory containing the llama.cpp libraries
+(default: `~/.unsloth/llama.cpp/build/bin`) and `CORTEX_CUDART_DIR` for the CUDA
+runtime directory.
+
+```bash
+cargo run --release --example ggml_bench -- MODEL "Once upon a time" 256 1024
+cargo run --release --example ggml_generate -- MODEL "Once upon a time" 32
+```
+
+Measured on RTX 2060 SUPER, Qwen2.5-0.5B Q4_K_M, decode only (prefill excluded):
+**245-309 tok/s** across runs; one run reached **308.68 tok/s**. The spread is
+caused by heavy host/GPU contention on the benchmark machine (a Minecraft
+client was using ~4 CPU cores and the GPU at the same time). Under idle
+conditions upstream `llama-bench` measures ~338 tok/s on this model.
+
+Greedy text matches the native Cortex CUDA path for the first ~12 tokens and
+then diverges at a near-tie argmax: llama.cpp uses its own KV-cache precision
+and kernel accumulation order. Treat this backend as a different numerical
+implementation, not as a bit-identical extension of the native engine.
+
 ## Optional paths (opt-in)
 
 ```bash
