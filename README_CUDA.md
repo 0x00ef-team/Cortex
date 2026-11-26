@@ -139,6 +139,31 @@ caused by heavy host/GPU contention on the benchmark machine (a Minecraft
 client was using ~4 CPU cores and the GPU at the same time). Under idle
 conditions upstream `llama-bench` measures ~338 tok/s on this model.
 
+### ornith 1.5 9b
+
+The hybrid `qwen35` model `ornith 1.5 9b` (8.86 GiB Q8_0) does not fit into the
+8 GB VRAM of the test GPU. With `CORTEX_GGML_NGL=24` (24/32 layers on GPU) the
+llama.cpp FFI backend runs it at **~5.9 tok/s** and produces coherent text,
+unlike the experimental native `qwen35` path.
+
+Re-quantizing to Q4_K_M with `--allow-requantize` shrinks it to 5.24 GiB, so all
+layers fit in VRAM:
+
+```bash
+llama-quantize --allow-requantize MODEL.Q8_0.gguf ornith-1.5-9b-q4km.gguf Q4_K_M 4
+./target/release/examples/ggml_bench ornith-1.5-9b-q4km.gguf "Hello" 128 512
+# throughput: 57.27-57.48 tok/s (three runs)
+```
+
+This is ~10× faster than the partial offload, but still far from the 300+
+tok/s reached with the 0.5B model — a 9B model reads ~5 GiB of weights per
+token, so the VRAM bandwidth floor alone is ~18 ms/token (~55 tok/s). Reaching
+300+ on `ornith 1.5 9b` would need a much smaller quantization, a much faster
+GPU, or batching.
+
+`CORTEX_GGML_NGL` overrides the number of GPU layers (default `-1` = all);
+`CORTEX_GGML_LOG=1` keeps llama.cpp's verbose log for debugging.
+
 Greedy text matches the native Cortex CUDA path for the first ~12 tokens and
 then diverges at a near-tie argmax: llama.cpp uses its own KV-cache precision
 and kernel accumulation order. Treat this backend as a different numerical

@@ -201,3 +201,21 @@ The machine was under heavy concurrent load (Minecraft using ~4 CPU cores and
 the GPU), hence the spread. The native Cortex CUDA engine measured 192-230
 tok/s in the same sessions. `CORTEX_GGML_DIR` must point to a built llama.cpp
 `bin` directory; the backend is loaded with `dlopen` at runtime.
+
+### ornith 1.5 9b via llama.cpp CUDA FFI (Nov 26)
+
+The hybrid `qwen35` model `ornith 1.5 9b` is 8.86 GiB in Q8_0 — too large for
+the 7.78 GiB VRAM of the RTX 2060 SUPER.
+
+| Configuration | tok/s |
+|---|---|
+| FFI, Q8_0, `CORTEX_GGML_NGL=24` (24/32 layers on GPU) | 5.90 |
+| FFI, Q4_K_M re-quantized from Q8_0 (5.24 GiB, all layers on GPU) | 57.27 / 57.44 / 57.48 |
+
+Q4_K_M was produced with:
+`llama-quantize --allow-requantize MODEL.Q8_0.gguf ornith-1.5-9b-q4km.gguf Q4_K_M 4`
+
+Greedy generation stays coherent over 48 tokens (`"Hello"` → normal English
+prose). The experimental native `qwen35` path still produces nonsensical
+tokens; output quality there remains unvalidated. The Q4_K_M file is a local
+artifact and is not part of the repository.

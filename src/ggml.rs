@@ -143,7 +143,9 @@ impl Lib {
                 Option<unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>, *mut c_void,
             ) = sym(ggml, "ggml_log_set")?;
             unsafe extern "C" fn quiet(_: c_int, _: *const c_char, _: *mut c_void) {}
-            ggml_log_set(Some(quiet), std::ptr::null_mut());
+            if std::env::var_os("CORTEX_GGML_LOG").is_none() {
+                ggml_log_set(Some(quiet), std::ptr::null_mut());
+            }
             let load_all: unsafe extern "C" fn(*const c_char) = sym(ggml, "ggml_backend_load_all_from_path")?;
             let d = CString::new(dir.clone()).unwrap();
             load_all(d.as_ptr());
@@ -153,7 +155,9 @@ impl Lib {
             // the decode itself at batch=1.
             let log_set: unsafe extern "C" fn(Option<unsafe extern "C" fn(/*level*/ c_int, *const c_char, *mut c_void)>, *mut c_void) =
                 sym(h, "llama_log_set")?;
-            log_set(Some(quiet), std::ptr::null_mut());
+            if std::env::var_os("CORTEX_GGML_LOG").is_none() {
+                log_set(Some(quiet), std::ptr::null_mut());
+            }
             Ok(Self {
                 _h: h,
                 _ggml: ggml,
@@ -197,8 +201,13 @@ impl GgmlCuda {
     pub fn load(path: impl AsRef<Path>, context: usize, threads: i32) -> Result<Self> {
         let lib = Lib::open()?;
         let mut mp = unsafe { (lib.default_model)() };
-        // n_gpu_layers = -1 at offset 16 (see mirrored header layout).
-        put_i32(&mut mp.0, 16, -1);
+        // n_gpu_layers at offset 16 (see mirrored header layout).
+        // -1 offloads everything; large models need a smaller value.
+        let ngl = std::env::var("CORTEX_GGML_NGL")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(-1);
+        put_i32(&mut mp.0, 16, ngl);
         let path = CString::new(path.as_ref().to_string_lossy().as_bytes()).unwrap();
         let model = unsafe { (lib.load)(path.as_ptr(), mp) };
         if model.is_null() {
