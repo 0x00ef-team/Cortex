@@ -202,6 +202,16 @@ impl Llama {
         self.pool.len()
     }
 
+    /// CUDA `(total ns, calls)` if the GPU backend is active.
+    pub fn cuda_stats(&self) -> Option<(u64, u64)> {
+        self.gpu.as_ref().map(|d| d.stats())
+    }
+
+    /// Per-shape CUDA matvec statistics.
+    pub fn cuda_stats_by_shape(&self) -> Option<std::collections::HashMap<(usize, usize), (u64, u64)>> {
+        self.gpu.as_ref().map(|d| d.stats_by_shape())
+    }
+
     /// Drop all cached keys/values so the model can be reused for a new prompt.
     pub fn reset_cache(&mut self) {
         for c in &mut self.cache {
@@ -265,6 +275,21 @@ impl Llama {
                 _ => m.matvec_pool(x, out, &pool),
             }
         };
+        let mvs = |bufs: &[Option<&CudaBuffer>],
+                   mats: &[&crate::tensor::Matrix],
+                   x: &[f32],
+                   outs: &mut [&mut [f32]]|
+         -> Result<()> {
+            if let Some(d) = gpu {
+                let refs: Vec<&CudaBuffer> = bufs.iter().flatten().copied().collect();
+                d.matvec_many(&refs, x, outs)
+            } else {
+                for (m, o) in mats.iter().zip(outs.iter_mut()) {
+                    m.matvec_pool(x, o, &pool)?;
+                }
+                Ok(())
+            }
+        };
 
         for li in 0..cfg.n_layers {
             let lw = &weights.layers[li];
@@ -273,9 +298,12 @@ impl Llama {
             lw.attn_norm.row(0, &mut norm_buf)?;
             rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
             let gl = gw.map(|g| &g.layers[li]);
-            mv(gl.map(|g| &g.wq), &lw.wq, &xb, &mut q)?;
-            mv(gl.map(|g| &g.wk), &lw.wk, &xb, &mut k)?;
-            mv(gl.map(|g| &g.wv), &lw.wv, &xb, &mut v)?;
+            mvs(
+                &[gl.map(|g| &g.wq), gl.map(|g| &g.wk), gl.map(|g| &g.wv)],
+                &[&lw.wq, &lw.wk, &lw.wv],
+                &xb,
+                &mut [&mut q, &mut k, &mut v],
+            )?;
             if let Some(b) = &lw.bq {
                 let mut bias = vec![0.0f32; q.len()];
                 b.row(0, &mut bias)?;
@@ -332,10 +360,18 @@ impl Llama {
             // --- SwiGLU feed-forward network ---
             lw.ffn_norm.row(0, &mut norm_buf)?;
             rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
-            mv(gl.map(|g| &g.w_gate), &lw.w_gate, &xb, &mut gate)?;
-            mv(gl.map(|g| &g.w_up), &lw.w_up, &xb, &mut up)?;
-            swiglu(&gate, &up, &mut act)?;
-            mv(gl.map(|g| &g.w_down), &lw.w_down, &act, &mut down)?;
+            if let (Some(d), Some(gl)) = (gpu, gl) {
+                d.ffn(&gl.w_gate, &gl.w_up, &gl.w_down, &xb, &mut down, cfg.n_ffn)?;
+            } else {
+                mvs(
+                    &[],
+                    &[&lw.w_gate, &lw.w_up],
+                    &xb,
+                    &mut [&mut gate, &mut up],
+                )?;
+                swiglu(&gate, &up, &mut act)?;
+                mv(None, &lw.w_down, &act, &mut down)?;
+            }
             for i in 0..cfg.n_embd {
                 x[i] += down[i];
             }
@@ -345,7 +381,11 @@ impl Llama {
         rmsnorm(&x, &norm_buf, cfg.rms_eps, &mut xb)?;
 
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        mv(gw.map(|g| &g.output), &weights.output, &xb, &mut logits)?;
+        if let (Some(d), Some(g)) = (gpu, gw) {
+            d.matvec_tall(&g.output, &xb, &mut logits)?;
+        } else {
+            mv(None, &weights.output, &xb, &mut logits)?;
+        }
         Ok(logits)
     }
 }

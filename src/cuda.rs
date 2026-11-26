@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::error::{Error, Result};
 
@@ -89,12 +91,45 @@ extern "C" __global__ void matvec_f32(
     for (int t = (cols / 4) * 4; t < cols; ++t) sum += rowf[t] * x[t];
     y[r] = sum;
 }
+// Coalesced variant for tall matrices (e.g. the 152k-row output head): one
+// block per row, threads strided over columns with a shared-memory reduction.
+extern "C" __global__ void matvec_tall(
+    const float* __restrict__ W,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int cols)
+{
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    const float* row = W + (size_t)r * cols;
+    for (int c = tid; c < cols; c += blockDim.x) sum += row[c] * x[c];
+    __shared__ float partial[256];
+    partial[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = partial[0];
+}
+
+extern "C" __global__ void swiglu_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
 "#;
 
 /// A buffer allocated in device memory.
 pub struct CudaBuffer {
     ptr: u64,
-    len: usize,
 }
 
 impl Drop for CudaBuffer {
@@ -111,6 +146,8 @@ static mut LETS_FREE: fn(u64) = |_| {};
 
 struct Api {
     function: u64,
+    tall: u64,
+    swiglu: u64,
     cu_mem_alloc: CuMemAlloc,
     cu_memcpy_h2d: CuMemcpyHtoD,
     cu_memcpy_d2h: CuMemcpyDtoH,
@@ -124,8 +161,11 @@ unsafe impl Sync for Api {}
 /// Initialized CUDA device with the JIT-compiled `matvec` kernel.
 pub struct CudaDevice {
     api: Arc<Api>,
-    /// Reused `x` / `y` buffers, keyed by `(x_len, out_len)`.
-    scratch: Mutex<HashMap<(usize, usize), (CudaBuffer, CudaBuffer)>>,
+    /// Reused scratch buffers keyed by `(x_len, out_len)`; slot 0 is `x`.
+    scratch: Mutex<HashMap<(usize, usize), Vec<CudaBuffer>>>,
+    matvec_ns: AtomicU64,
+    matvec_calls: AtomicU64,
+    by_shape: Mutex<HashMap<(usize, usize), (u64, u64)>>,
 }
 
 impl CudaDevice {
@@ -212,12 +252,20 @@ impl CudaDevice {
             let fname = CString::new("matvec_f32").unwrap();
             let mut function = 0u64;
             check(cu_module_fn(&mut function, module, fname.as_ptr()), "cuModuleGetFunction")?;
+            let tname = CString::new("matvec_tall").unwrap();
+            let mut tall = 0u64;
+            check(cu_module_fn(&mut tall, module, tname.as_ptr()), "cuModuleGetFunction(tall)")?;
+            let swname = CString::new("swiglu_kernel").unwrap();
+            let mut swiglu = 0u64;
+            check(cu_module_fn(&mut swiglu, module, swname.as_ptr()), "cuModuleGetFunction(swiglu)")?;
 
             LETS_FREE = std::mem::transmute::<CuMemFree, fn(u64)>(cu_mem_free);
 
             Ok(Self {
                 api: Arc::new(Api {
                     function,
+                    tall,
+                    swiglu,
                     cu_mem_alloc,
                     cu_memcpy_h2d,
                     cu_memcpy_d2h,
@@ -225,6 +273,9 @@ impl CudaDevice {
                     cu_sync,
                 }),
                 scratch: Mutex::new(HashMap::new()),
+                matvec_ns: AtomicU64::new(0),
+                matvec_calls: AtomicU64::new(0),
+                by_shape: Mutex::new(HashMap::new()),
             })
         }
     }
@@ -239,44 +290,156 @@ impl CudaDevice {
                 "cuMemcpyHtoD",
             )?;
         }
-        Ok(CudaBuffer { ptr, len: data.len() })
+        Ok(CudaBuffer { ptr })
+    }
+
+    /// `(total nanoseconds, number of calls)` spent in `matvec` so far.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.matvec_ns.load(Ordering::Relaxed),
+            self.matvec_calls.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Per-shape `(rows, cols) -> (total ns, calls)` statistics.
+    pub fn stats_by_shape(&self) -> HashMap<(usize, usize), (u64, u64)> {
+        self.by_shape.lock().unwrap().clone()
+    }
+
+    /// Run several `out = W_i * x` products with a single synchronization.
+    ///
+    /// `slot` indexes into per-shape scratch buffers, so callers can group
+    /// q/k/v or gate/up without extra allocations.
+    pub fn matvec_many(
+        &self,
+        weights: &[&CudaBuffer],
+        x: &[f32],
+        outs: &mut [&mut [f32]],
+    ) -> Result<()> {
+        let started = Instant::now();
+        if weights.is_empty() || x.is_empty() {
+            return Ok(());
+        }
+        let cols = x.len() as i32;
+        let mut cache = self.scratch.lock().unwrap();
+        let xkey = (x.len(), 0usize);
+        let bufs = cache.entry(xkey).or_default();
+        if bufs.is_empty() {
+            bufs.push(self.upload(&vec![0.0f32; x.len()])?);
+        }
+        let x_ptr = bufs[0].ptr;
+        unsafe {
+            check(
+                (self.api.cu_memcpy_h2d)(x_ptr, x.as_ptr() as *const c_void, x.len() * 4),
+                "cuMemcpyHtoD(x)",
+            )?;
+        }
+
+        let threads = 256u32;
+        let mut pending: Vec<(u64, *mut f32, usize)> = Vec::with_capacity(weights.len());
+        let mut slot = 0usize;
+        for (w, out) in weights.iter().zip(outs.iter_mut()) {
+            if out.is_empty() {
+                continue;
+            }
+            let rows = out.len() as i32;
+            let ykey = (x.len(), out.len());
+            let bufs = cache.entry(ykey).or_default();
+            while bufs.len() <= slot {
+                bufs.push(self.upload(&vec![0.0f32; out.len()])?);
+            }
+            let y_ptr = bufs[slot].ptr;
+            unsafe {
+                let mut params: [*mut c_void; 5] = [
+                    &w.ptr as *const u64 as *mut c_void,
+                    &x_ptr as *const u64 as *mut c_void,
+                    &y_ptr as *const u64 as *mut c_void,
+                    &rows as *const i32 as *mut c_void,
+                    &cols as *const i32 as *mut c_void,
+                ];
+                let blocks = (out.len() as u32).div_ceil(threads);
+                check(
+                    (self.api.cu_launch)(
+                        self.api.function,
+                        blocks,
+                        1,
+                        1,
+                        threads,
+                        1,
+                        1,
+                        0,
+                        std::ptr::null_mut(),
+                        params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    ),
+                    "cuLaunchKernel",
+                )?;
+            }
+            pending.push((y_ptr, out.as_mut_ptr(), out.len()));
+            slot += 1;
+        }
+
+        unsafe { check((self.api.cu_sync)(), "cuCtxSynchronize")? };
+        for (y, host, len) in pending {
+            unsafe {
+                check(
+                    (self.api.cu_memcpy_d2h)(host as *mut c_void, y, len * 4),
+                    "cuMemcpyDtoH",
+                )?;
+            }
+        }
+
+        let elapsed = started.elapsed().as_nanos() as u64;
+        self.matvec_ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.matvec_calls.fetch_add(weights.len() as u64, Ordering::Relaxed);
+        let mut shapes = self.by_shape.lock().unwrap();
+        for out in outs.iter() {
+            let entry = shapes.entry((out.len(), x.len())).or_insert((0, 0));
+            entry.0 += elapsed;
+            entry.1 += 1;
+        }
+        Ok(())
     }
 
     pub fn matvec(&self, weights: &CudaBuffer, x: &[f32], out: &mut [f32]) -> Result<()> {
-        if x.is_empty() || weights.len == 0 || out.is_empty() {
-            return Ok(());
-        }
-        let rows = out.len() as i32;
-        let cols = x.len() as i32;
-        let key = (x.len(), out.len());
+        self.matvec_many(&[weights], x, &mut [out])
+    }
+
+    /// Coalesced matvec for very tall matrices (the output head).
+    pub fn matvec_tall(&self, weights: &CudaBuffer, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let started = Instant::now();
         let mut cache = self.scratch.lock().unwrap();
-        if !cache.contains_key(&key) {
-            let xb = self.upload(&vec![0.0f32; x.len()])?;
-            let yb = self.upload(&vec![0.0f32; out.len()])?;
-            cache.insert(key, (xb, yb));
+        let xkey = (x.len(), 0usize);
+        let xbufs = cache.entry(xkey).or_default();
+        if xbufs.is_empty() {
+            xbufs.push(self.upload(&vec![0.0f32; x.len()])?);
         }
-        let (x_buf, y_buf) = cache.get(&key).unwrap();
+        let x_ptr = xbufs[0].ptr;
+        let ykey = (x.len(), out.len());
+        let ybufs = cache.entry(ykey).or_default();
+        if ybufs.is_empty() {
+            ybufs.push(self.upload(&vec![0.0f32; out.len()])?);
+        }
+        let y_ptr = ybufs[0].ptr;
         unsafe {
             check(
-                (self.api.cu_memcpy_h2d)(x_buf.ptr, x.as_ptr() as *const c_void, x.len() * 4),
+                (self.api.cu_memcpy_h2d)(x_ptr, x.as_ptr() as *const c_void, x.len() * 4),
                 "cuMemcpyHtoD(x)",
             )?;
-            let mut params: [*mut c_void; 5] = [
+            let cols = x.len() as i32;
+            let mut params: [*mut c_void; 4] = [
                 &weights.ptr as *const u64 as *mut c_void,
-                &x_buf.ptr as *const u64 as *mut c_void,
-                &y_buf.ptr as *const u64 as *mut c_void,
-                &rows as *const i32 as *mut c_void,
+                &x_ptr as *const u64 as *mut c_void,
+                &y_ptr as *const u64 as *mut c_void,
                 &cols as *const i32 as *mut c_void,
             ];
-            let threads = 256u32;
-            let blocks = (out.len() as u32).div_ceil(threads);
             check(
                 (self.api.cu_launch)(
-                    self.api.function,
-                    blocks,
+                    self.api.tall,
+                    out.len() as u32,
                     1,
                     1,
-                    threads,
+                    256,
                     1,
                     1,
                     0,
@@ -284,14 +447,123 @@ impl CudaDevice {
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
-                "cuLaunchKernel",
+                "cuLaunchKernel(tall)",
             )?;
             check((self.api.cu_sync)(), "cuCtxSynchronize")?;
             check(
-                (self.api.cu_memcpy_d2h)(out.as_mut_ptr() as *mut c_void, y_buf.ptr, out.len() * 4),
+                (self.api.cu_memcpy_d2h)(out.as_mut_ptr() as *mut c_void, y_ptr, out.len() * 4),
                 "cuMemcpyDtoH",
             )?;
         }
+        let elapsed = started.elapsed().as_nanos() as u64;
+        self.matvec_ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Complete SwiGLU feed-forward block in one synchronization:
+    /// `gate = Wg*x`, `up = Wu*x`, `act = silu(gate)*up`, `out = Wd*act`.
+    pub fn ffn(
+        &self,
+        w_gate: &CudaBuffer,
+        w_up: &CudaBuffer,
+        w_down: &CudaBuffer,
+        x: &[f32],
+        out: &mut [f32],
+        ffn_len: usize,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let cols = x.len() as i32;
+        let mut cache = self.scratch.lock().unwrap();
+
+        let xkey = (x.len(), 0usize);
+        let xbufs = cache.entry(xkey).or_default();
+        if xbufs.is_empty() {
+            xbufs.push(self.upload(&vec![0.0f32; x.len()])?);
+        }
+        let x_ptr = xbufs[0].ptr;
+        unsafe {
+            check(
+                (self.api.cu_memcpy_h2d)(x_ptr, x.as_ptr() as *const c_void, x.len() * 4),
+                "cuMemcpyHtoD(x)",
+            )?;
+        }
+
+        let threads = 256u32;
+        let mut ensure = |key: (usize, usize), slot: usize| -> Result<u64> {
+            let bufs = cache.entry(key).or_default();
+            while bufs.len() <= slot {
+                bufs.push(self.upload(&vec![0.0f32; key.1])?);
+            }
+            Ok(bufs[slot].ptr)
+        };
+        let gate_ptr = ensure((x.len(), ffn_len), 0)?;
+        let up_ptr = ensure((x.len(), ffn_len), 1)?;
+        let act_ptr = ensure((x.len(), ffn_len), 2)?;
+        let down_ptr = ensure((x.len(), out.len()), 0)?;
+
+        unsafe {
+            let launch_mv = |w: &CudaBuffer, xptr: u64, yptr: u64, rows: i32, incols: i32| {
+                let mut params: [*mut c_void; 5] = [
+                    &w.ptr as *const u64 as *mut c_void,
+                    &xptr as *const u64 as *mut c_void,
+                    &yptr as *const u64 as *mut c_void,
+                    &rows as *const i32 as *mut c_void,
+                    &incols as *const i32 as *mut c_void,
+                ];
+                check(
+                    (self.api.cu_launch)(
+                        self.api.function,
+                        (rows as u32).div_ceil(threads),
+                        1, 1, threads, 1, 1, 0,
+                        std::ptr::null_mut(),
+                        params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    ),
+                    "cuLaunchKernel(mv)",
+                )
+            };
+            launch_mv(w_gate, x_ptr, gate_ptr, ffn_len as i32, cols)?;
+            launch_mv(w_up, x_ptr, up_ptr, ffn_len as i32, cols)?;
+
+            let mut sp: [*mut c_void; 4] = [
+                &gate_ptr as *const u64 as *mut c_void,
+                &up_ptr as *const u64 as *mut c_void,
+                &act_ptr as *const u64 as *mut c_void,
+                &(ffn_len as i32) as *const i32 as *mut c_void,
+            ];
+            check(
+                (self.api.cu_launch)(
+                    self.api.swiglu,
+                    (ffn_len as u32).div_ceil(threads),
+                    1, 1, threads, 1, 1, 0,
+                    std::ptr::null_mut(),
+                    sp.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel(swiglu)",
+            )?;
+
+            let incols = ffn_len as i32;
+            launch_mv(w_down, act_ptr, down_ptr, out.len() as i32, incols)?;
+
+            check((self.api.cu_sync)(), "cuCtxSynchronize")?;
+            check(
+                (self.api.cu_memcpy_d2h)(
+                    out.as_mut_ptr() as *mut c_void,
+                    down_ptr,
+                    out.len() * 4,
+                ),
+                "cuMemcpyDtoH",
+            )?;
+        }
+        let elapsed = started.elapsed().as_nanos() as u64;
+        self.matvec_ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.matvec_calls.fetch_add(3, Ordering::Relaxed);
+        let mut shapes = self.by_shape.lock().unwrap();
+        let entry = shapes.entry((out.len(), x.len())).or_insert((0, 0));
+        entry.0 += elapsed;
+        entry.1 += 1;
         Ok(())
     }
 }

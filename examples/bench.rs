@@ -70,5 +70,20 @@ fn main() -> Result<()> {
     println!("throughput:   {:.2} tok/s (prefill included)",
         out.token_count as f64 / total.as_secs_f64());
     println!("threads:      {}", engine.model.threads());
+    if let Some((ns, calls)) = engine.model.cuda_stats() {
+        println!("GPU matvec:   {:.2} ms total / {} calls ({:.0} us/call)",
+            ns as f64 / 1e6, calls, ns as f64 / calls.max(1) as f64 / 1e3);
+        let mut by: Vec<_> = engine
+            .model
+            .cuda_stats_by_shape()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        by.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for ((rows, cols), (ns, calls)) in by.into_iter().take(6) {
+            println!("  {rows:>6}x{cols:<6} {:.1} ms / {} calls ({:.0} us/call)",
+                ns as f64 / 1e6, calls, ns as f64 / calls.max(1) as f64 / 1e3);
+        }
+    }
     Ok(())
 }

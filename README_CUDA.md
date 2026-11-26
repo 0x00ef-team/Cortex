@@ -79,15 +79,17 @@ once and uploaded to VRAM at load time. If CUDA is unavailable, use
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~36–38 tok/s** |
+| **Cortex CUDA** | **~41–42 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~10 tok/s |
 
 Model load (GGUF parsing + dequantization + ~2 GB upload) takes ~2.7 s and is
 excluded from throughput.
 
-The CUDA backend is therefore roughly **1.5× faster than llama.cpp** on this
-machine, exceeding the initial +15–20% target.
+The CUDA backend is therefore roughly **1.7× faster than llama.cpp** on this
+machine, exceeding the initial +15–20% target. Grouped launches (q/k/v and
+gate/up/silu/down with one synchronization each) and a coalesced output-head
+kernel were used to get from ~36 to ~42 tok/s.
 
 ## Roadmap
 
@@ -99,6 +101,8 @@ machine, exceeding the initial +15–20% target.
 - [ ] GPU kernels for Q4_K/Q8_0 (large models in VRAM)
 - [ ] CUDA Graphs and stream overlap
 - [ ] Attention / softmax on GPU
+- [ ] Keep residuals/norms on GPU: currently ~97 synchronizations per token,
+      one per layer group; fusing the whole layer would cut this to ~3
 
 ## Environment check
 
