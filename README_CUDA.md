@@ -88,18 +88,21 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 | Configuration | Throughput |
 |---|---|
 | **Cortex CUDA** | **~41–42 tok/s** |
-| Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
-| llama.cpp GPU, same Gemma 4 model | ~3 tok/s |
+| llama.cpp b12755, **CUDA**, 8 threads, ngl=99 | **~338 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
+| Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
+| llama.cpp CUDA, same Gemma 4 model | ~3 tok/s |
 | Cortex CPU, Lazy + SIMD | ~10 tok/s |
 
 Model load (GGUF parsing + dequantization + ~2 GB upload) takes ~2.7 s and is
 excluded from throughput.
 
-The CUDA backend is therefore roughly **1.7× faster than llama.cpp** on this
-machine, exceeding the initial +15–20% target. Grouped launches (q/k/v and
-gate/up/silu/down with one synchronization each) and a coalesced output-head
-kernel were used to get from ~36 to ~42 tok/s.
+Honest conclusion: Cortex CUDA is ~1.7× faster than llama.cpp **CPU**, but
+~8× slower than llama.cpp **CUDA** on the same Qwen model. The initial goal was
+measured against the CPU build only. The remaining GPU gap is launch overhead
+(~97 synchronizations per token) and the lack of fused attention kernels.
+Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
+kernel moved Cortex from ~36 to ~42 tok/s.
 
 ## Roadmap
 

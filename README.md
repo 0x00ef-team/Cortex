@@ -16,8 +16,9 @@ external dependencies** for the CPU path — no `ndarray`, no `candle`, no
 
 It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.)
 and **Gemma 4** dense text models, including quantized weights, and offers an
-optional CUDA backend that is about **1.7× faster than llama.cpp** on the test
-machine. GGUF files are memory-mapped, so loading a 4.8 GB model takes ~0.5 s.
+optional CUDA backend that is ~1.7× faster than llama.cpp **CPU** on the test
+machine (but ~8× slower than llama.cpp CUDA). GGUF files are memory-mapped, so
+loading a 4.8 GB model takes ~0.5 s.
 
 ### Features
 
@@ -91,11 +92,12 @@ See [README_CUDA.md](README_CUDA.md) for the CUDA backend design and benchmarks.
 | Configuration | Throughput |
 |---|---|
 | **Cortex CUDA** | **~41–42 tok/s** |
+| llama.cpp b12755, CUDA, 8 threads | ~338 tok/s |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~4–10 tok/s |
 
-The original goal of beating llama.cpp by 15–20% is exceeded with the CUDA
-backend (~1.7×). CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
+The original goal of beating llama.cpp **CPU** by 15–20% is exceeded (~1.7×),
+but llama.cpp CUDA is still ~8× faster. CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
 kernels, block-wise dequantization into an L1-resident buffer, and a persistent
 thread pool.
 
@@ -151,7 +153,7 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 CodeLlama и др.) и плотные текстовые модели **Gemma 4**, включая квантованные
 веса. GGUF-файлы отображаются в память через mmap, поэтому загрузка модели
 на 4.8 ГБ занимает ~0.5 с. Есть опциональный CUDA-бэкенд, который на тестовой
-машине **примерно в 1.7 раза быстрее llama.cpp**.
+машине **примерно в 1.7 раза быстрее llama.cpp CPU** (но ~в 8 раз медленнее llama.cpp CUDA).
 
 ### Возможности
 
@@ -225,11 +227,12 @@ cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
 | Конфигурация | Скорость |
 |---|---|
 | **Cortex CUDA** | **~41–42 ток/с** |
+| llama.cpp b12755, CUDA, 8 потоков | ~338 ток/с |
 | llama.cpp b12755, CPU, 8 потоков | ~24 ток/с |
 | Cortex CPU, Lazy + SIMD | ~4–10 ток/с |
 
-Изначальная цель — обогнать llama.cpp на 15–20% — превышена с CUDA-бэкендом
-(~1.7×). CPU-оптимизации: AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K,
+Изначальная цель — обогнать llama.cpp **CPU** на 15–20% — превышена с CUDA-бэкендом
+(~1.7×), но llama.cpp CUDA всё ещё ~в 8 раз быстрее. CPU-оптимизации: AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K,
 деквантовка блоками в L1-буфер и постоянный пул потоков.
 
 ### Тесты без модели
