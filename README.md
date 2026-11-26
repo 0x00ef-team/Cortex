@@ -6,6 +6,8 @@
 [![CUDA](https://img.shields.io/badge/CUDA-working-brightgreen.svg)](README_CUDA.md)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+[Benchmarks](BENCHMARKS.md) · [Contributing](CONTRIBUTING.md) · [CUDA backend](README_CUDA.md)
+
 ---
 
 ## English
@@ -144,6 +146,8 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 ---
 
 ## Русский
+
+Документы: [бенчмарки](BENCHMARKS.md) · [как участвовать](CONTRIBUTING.md) · [CUDA-бэкенд](README_CUDA.md).
 
 **Cortex** — LLM inference-движок, написанный с нуля на Rust. CPU-путь не имеет
 внешних зависимостей: никаких `ndarray`, `candle`, `llama.cpp` или crates для
