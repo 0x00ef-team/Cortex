@@ -66,9 +66,9 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 - Full-GPU forward for LLaMA/Qwen2: weights are dequantized to f16 once and
   uploaded; x, KV cache, RoPE, attention, residuals and FFN stay in VRAM, so
   only logits are copied back (one synchronization per token).
-- CUDA Graph capture/replay works but must use a separate stream from the
-  input copies; enable with `CORTEX_CUDA_GRAPH=1`. Speed gain is small because
-  the engine is bandwidth-bound in VRAM.
+- CUDA Graph capture/replay works (input copies are synchronous, then the whole
+  step is captured and replayed); enable with `CORTEX_CUDA_GRAPH=1`. Speed gain
+  is small because the engine is bandwidth-bound in VRAM.
 - Each layer uploads 7 matrices; the final projection is uploaded too. Small
   tensors (norms, embeddings) stay on CPU.
 
@@ -81,8 +81,6 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 - Gemma 4 is supported via on-the-fly GPU dequantization kernels for Q4_K,
   Q5_K, Q6_K, Q8_0, F16 and F32 — weights stay compressed in VRAM (~4.8 GB),
   so a 4B model fits into 8 GB. Attention/norms for Gemma 4 remain on CPU.
-- No CUDA Graphs: each `matvec` issues a memcpy, a launch, a sync and a copy
-  back. Overlap across layers is future work.
 - Attention / KV cache are scalar on CPU.
 
 ## Benchmarks
@@ -92,7 +90,8 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~226 tok/s** |
+| **Cortex CUDA (native engine)** | **~192-230 tok/s** |
+| Cortex CUDA + optional llama.cpp FFI backend, decode only | ~245-309 tok/s (peak 308.68) |
 | llama.cpp b12755, **CUDA**, 8 threads, ngl=99 | **~338 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
@@ -102,12 +101,19 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 Model load (GGUF parsing + dequantization + ~2 GB upload) takes ~2.7 s and is
 excluded from throughput.
 
-Honest conclusion: Cortex CUDA is ~1.7× faster than llama.cpp **CPU**, but
-~1.7× slower than llama.cpp **CUDA** on the same Qwen model. The initial goal was
-measured against the CPU build only. The remaining GPU gap is launch overhead
-(~97 synchronizations per token) and the lack of fused attention kernels.
-Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
-kernel moved Cortex from ~36 to ~228 tok/s.
+Honest conclusion: the native Cortex CUDA engine is ~10× faster than llama.cpp
+**CPU**, but ~1.5× slower than llama.cpp **CUDA** on the same Qwen model. The
+initial goal was measured against the CPU build only. CUDA Graphs and a fused
+Q4_K (MMQ-style) kernel are implemented but throughput-neutral — decode is
+limited by weight streaming from VRAM, not by launch overhead. Grouped launches
+(q/k/v and gate/up/silu/down), a coalesced output-head kernel and GPU argmax
+moved Cortex from ~36 to ~226 tok/s.
+
+The optional llama.cpp FFI backend reaches **308.68 tok/s** in one measured run
+(decode only), i.e. the 300+ target was hit once, but the same binary measured
+245-309 tok/s across runs because the host was under heavy concurrent load
+(Minecraft using ~4 CPU cores and the GPU). This is not a stable, reproducible
+300+ result for the native engine; see `BENCHMARKS.md` for every data point.
 
 ## Optional llama.cpp CUDA FFI backend
 
