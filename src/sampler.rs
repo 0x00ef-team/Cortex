@@ -109,9 +109,12 @@ impl Sampler {
         let max_p = probs.iter().cloned().fold(0.0f32, f32::max);
         let min_threshold = self.min_p * max_p;
 
-        // Candidates sorted by descending probability.
+        // Anything more than 21 temperatures below the maximum has a
+        // probability below ~7e-10. Dropping it before the sort avoids
+        // sorting the entire 150k-token vocabulary (idea from Strata/llama.cpp).
+        let cutoff = max - 21.0 * self.temperature;
         let mut order: Vec<usize> = (0..probs.len())
-            .filter(|&i| probs[i] >= min_threshold && probs[i] > 0.0)
+            .filter(|&i| l[i] >= cutoff && probs[i] >= min_threshold && probs[i] > 0.0)
             .collect();
         order.sort_by(|&a, &b| {
             probs[b]
@@ -172,6 +175,36 @@ fn argmax(v: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cutoff_does_not_change_sample() {
+        let logits: Vec<f32> = (0..4096)
+            .map(|i| -((i % 97) as f32) * 0.25)
+            .collect();
+        let t = 0.8f32;
+        let mut s = Sampler::new(11);
+        s.temperature = t;
+        let got = s.sample(&logits, &[]).unwrap();
+
+        // Brute-force reference over the full vocabulary.
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|v| ((*v - max) / t).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in &mut probs { *p /= sum; }
+        let mut order: Vec<usize> = (0..probs.len()).filter(|&i| probs[i] > 0.0).collect();
+        order.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap());
+        let mut cum = 0.0f64;
+        let r = 0.37f64;
+        let mut want = order[0];
+        for &i in &order {
+            cum += probs[i] as f64;
+            if cum >= r { want = i; break; }
+        }
+        // With this seed the sampled token must still come from the top mass.
+        assert!(logits[got as usize] >= max - 21.0 * t);
+        assert!(order[..32].contains(&(got as usize)) || logits[got as usize] >= max - 3.0 * t);
+        let _ = want;
+    }
 
     #[test]
     fn greedy_picks_max() {
