@@ -20,7 +20,9 @@ It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.)
 and **Gemma 4** dense text models, including quantized weights, and offers an
 optional CUDA backend that is ~1.7× faster than llama.cpp **CPU** on the test
 machine (but ~8× slower than llama.cpp CUDA). GGUF files are memory-mapped, so
-loading a 4.8 GB model takes ~0.5 s.
+loading a 4.8 GB model takes ~0.5 s. The local crate in `Cargo.toml` is named
+`cortex-llm` (not published to crates.io yet); the library is imported as
+`cortex`.
 
 ### Features
 
@@ -158,6 +160,7 @@ CodeLlama и др.) и плотные текстовые модели **Gemma 4*
 веса. GGUF-файлы отображаются в память через mmap, поэтому загрузка модели
 на 4.8 ГБ занимает ~0.5 с. Есть опциональный CUDA-бэкенд, который на тестовой
 машине **примерно в 1.7 раза быстрее llama.cpp CPU** (но ~в 8 раз медленнее llama.cpp CUDA).
+В `Cargo.toml` локальный пакет называется `cortex-llm` (на crates.io он пока не опубликован), библиотека по-прежнему импортируется как `cortex`.
 
 ### Возможности
 
