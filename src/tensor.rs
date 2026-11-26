@@ -301,7 +301,8 @@ impl Matrix {
         if pool.len() <= 1 || self.rows < 256 {
             return self.matvec_range(x, out, 0, self.rows);
         }
-        let tasks = pool.len().min(self.rows);
+        // Give each worker at least 128 rows; extra threads only add sync overhead.
+        let tasks = pool.len().min(self.rows.div_ceil(128)).max(1);
         let chunk = self.rows.div_ceil(tasks);
         let m_ptr = self as *const Matrix as usize;
         let x_ptr = x.as_ptr() as usize;
