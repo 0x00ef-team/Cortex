@@ -1,28 +1,37 @@
 # Cortex
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#сборка)
-[![Tests](https://img.shields.io/badge/tests-23%20passed-brightgreen.svg)](#тесты-без-модели)
-[![CUDA](https://img.shields.io/badge/CUDA-roadmap-yellow.svg)](README_CUDA.md)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#лицензия)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#build)
+[![Tests](https://img.shields.io/badge/tests-23%20passed-brightgreen.svg)](#tests-without-a-model)
+[![CUDA](https://img.shields.io/badge/CUDA-working-brightgreen.svg)](README_CUDA.md)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Cortex** — LLM inference-движок, написанный с нуля на Rust. Без внешних зависимостей: никаких `ndarray`, ` candle`, `llama.cpp` или tokenizers. Только `std`.
+---
 
-Поддерживаются обычные GGUF-модели семейства LLaMA (LLaMA 2/3, Mistral, Qwen2, CodeLlama и т.п.) с квантованными весами.
+## English
 
-## Что реализовано
+**Cortex** is an LLM inference engine written from scratch in Rust, with **zero
+external dependencies** for the CPU path — no `ndarray`, no `candle`, no
+`llama.cpp`, no tokenizer crates. Just `std`.
 
-| Подсистема | Что внутри |
+It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.),
+including quantized weights, and offers an optional CUDA backend that is about
+**1.7× faster than llama.cpp** on the test machine.
+
+### Features
+
+| Subsystem | What is implemented |
 |---|---|
-| GGUF v3 | парсер заголовка, метаданных и дескрипторов тензоров; ленивое чтение данных напрямую из файла |
-| Квантование | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K — все деквантовщики портированы с эталонных C-реализаций ggml |
-| Математика | `matvec` с развёрнутыми аккумуляторами, RMSNorm, softmax, RoPE (LLaMA и NeoX), SwiGLU |
-| Трансформер | LLaMA-архитектура, grouped-query attention (GQA), KV-кэш с геометрическим ростом |
-| Токенизатор | BPE по GGUF-словарю, режимы SentencePiece (`▁`) и GPT-2/Qwen (byte→unicode), byte-fallback `<0xXX>` |
-| Сэмплинг | greedy, temperature, top-k, top-p (nucleus), min-p, repetition penalty, детерминированный xorshift64 RNG |
-| Генерация | префилл, потоковая выдача по завершённым UTF-8- кодпоинтам, stop-by-EOS |
+| GGUF v3 | Header, metadata and tensor descriptors; tensor data read lazily from the file |
+| Quantization | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — all dequantizers ported from the reference ggml C code |
+| Math | Unrolled `dot`, AVX/SSE4.1 SIMD fused kernels, RMSNorm, stable softmax, RoPE (LLaMA + NeoX), SwiGLU |
+| Transformer | LLaMA-style blocks, grouped-query attention, geometrically growing KV cache, Qwen attention biases |
+| Tokenizer | BPE built from GGUF vocabularies, SentencePiece and GPT-2/Qwen modes, explicit merge list, `<0xXX>` byte fallback |
+| Sampling | greedy, temperature, top-k, top-p, min-p, repetition penalty, deterministic xorshift64 RNG |
+| Generation | Prefill, streaming UTF-8-safe output, stop on EOS |
+| CUDA | JIT-compiled `matvec`, weights in VRAM, grouped launches, GPU SwiGLU |
 
-## Сборка
+### Build
 
 ```bash
 cd cortex
@@ -31,23 +40,7 @@ cargo test
 cargo bench
 ```
 
-## Использование
-
-### CLI
-
-```bash
-# Скачать, например, Q4_K_M:
-# https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF
-
-cargo run --release --example generate -- \
-  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  "Once upon a time" \
-  --temp 0.8 --top-p 0.9 --max 128 --seed 42
-```
-
-Флаги: `--temp`, `--max`, `--top-k`, `--top-p`, `--seed`, `--eager`.
-
-### Библиотека
+### Usage
 
 ```rust,no_run
 use cortex::{Engine, GenerateConfig, LoadOptions};
@@ -65,83 +58,202 @@ println!("\n{} tokens", out.token_count);
 # Ok::<(), cortex::Error>(())
 ```
 
-Ленивая деквантовка (по умолчанию) держат веса в компактном виде и деквантуют по строке на каждый `matvec`. Если памяти достаточно и нужна максимум скорости — `LoadOptions { dequant: DequantPolicy::Eager, .. }`.
-
-### Инспекция GGUF
+CLI:
 
 ```bash
+cargo run --release --example generate -- \
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf "Once upon a time" \
+  --temp 0.8 --top-p 0.9 --max 128 --seed 42 --threads 8
+
 cargo run --release --example info -- model.gguf
+cargo run --release --example tokens -- model.gguf "Hello world"
+cargo run --release --example bench -- model.gguf "Once upon a time" 64 --threads 8
 ```
 
-## Производительность (честно)
+GPU:
 
-На `Qwen2.5-0.5B-Instruct-Q4_K_M`, 8 потоков, один и тот же CPU:
+```bash
+cargo run --release --example generate -- model.gguf "Hello" --device cuda
+cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
+```
 
-| Движок | Декодирование |
+See [README_CUDA.md](README_CUDA.md) for the CUDA backend design and benchmarks.
+
+### Performance
+
+`Qwen2.5-0.5B-Instruct-Q4_K_M`, RTX 2060, 8 CPU threads where applicable:
+
+| Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** (RTX 2060) | **~41–42 ток/с** |
-| llama.cpp b12755 (8 threads) | ~24 ток/с |
-| Cortex, `Lazy` + SIMD (AVX/SSE4.1) + 8 потоков | ~4–10 ток/с |
+| **Cortex CUDA** | **~41–42 tok/s** |
+| llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
+| Cortex CPU, Lazy + SIMD | ~4–10 tok/s |
 
-Цель «на 15–20% быстрее llama.cpp» **достигнута с CUDA-бэкендом** (~1.7×). CPU-путь остаётся dependency-free и уступает. Что сделано:
+The original goal of beating llama.cpp by 15–20% is exceeded with the CUDA
+backend (~1.7×). CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
+kernels, block-wise dequantization into an L1-resident buffer, and a persistent
+thread pool.
 
-- AVX-векторизация `dot` (≈3× против скалярного цикла);
-- SIMD-ядра `dot_quant` для **Q8_0, Q5_0, Q4_K и Q6_K** (8-полосные AVX + SSE4.1-fallback); таблица расширения битов для Q5_0 убрала скалярный цикл;
-- деквантовка блоками в L1-буфер вместо материализации всей строки;
-- **постоянный пул потоков** с барьером — потоки создаются один раз при загрузке модели, а не на каждый `matvec`;
-- режим `Eager` для скорости ценой памяти.
+### Tests without a model
 
-Дальнейший резерв — SIMD-ядра для Q2_K/Q3_K, векторизация attention и prefetch весов.
-
-На машине с AVX2/FMA запуск со специфической сборкой даёт дополнительный выигрыш:
-
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-```
-
-```bash
-cargo run --release --example bench -- model.gguf "Once upon a time" 16 --threads 8
-cargo bench
-```
-
-## GPU
-
-CUDA-бэкенд **реализован**: `matvec` выполняется на GPU, ~36 ток/с на Qwen2.5-0.5B Q4_K_M (против ~24 у llama.cpp). Подробности: [README_CUDA.md](README_CUDA.md).
-
-## Тесты без модели
-
-Модуль `cortex::synthetic` умеет генерировать крошечный валидный GGUF (2 слоя, dim 16, vocab 32). На нём интеграционные тесты прогоняют весь конвейер: GGUF → токенизатор → трансформер → сэмплинг.
+The `cortex::synthetic` module generates a tiny valid GGUF (2 layers, dim 16,
+vocab 32), so integration tests exercise the full pipeline without downloading
+anything:
 
 ```bash
 cargo test
+cargo run --release --example make_tiny -- /tmp/tiny.gguf
 ```
 
-## Архитектура исходников
+Source layout:
+
+```
+src/
+  quant/dequant.rs   dequantization kernels for all supported GGML types
+  gguf/              GGUF container parser
+  tensor.rs          Matrix, matvec, lazy/eager dequantization
+  tokenizer/bpe.rs   BPE and text normalization
+  model/             config, attention kernels, KV cache, weights, forward pass
+  cuda.rs            CUDA driver FFI, NVRTC JIT, GPU matvec
+  sampler.rs         next-token sampling
+  generate.rs        generation loop
+  synthetic.rs       test-model generator
+```
+
+### Limitations
+
+- GGUF version 3 only.
+- 1-D and 2-D tensors; no MoE support.
+- CPU path is scalar/SIMD Rust: no GPU required, but slower than native C++.
+- CUDA path stores f32 weights in VRAM: a 7B model needs ~28 GB.
+- Exotic quantizations (IQ-*, TQ*) are not implemented.
+- Architectures outside LLaMA/Qwen2-style transformers (e.g. Gemma 4) are not supported.
+
+### License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+---
+
+## Русский
+
+**Cortex** — LLM inference-движок, написанный с нуля на Rust. CPU-путь не имеет
+внешних зависимостей: никаких `ndarray`, `candle`, `llama.cpp` или crates для
+токенизации — только `std`.
+
+Движок запускает GGUF-модели семейства LLaMA (LLaMA 2/3, Mistral, Qwen2,
+CodeLlama и др.), включая квантованные веса. Есть опциональный CUDA-бэкенд,
+который на тестовой машине **примерно в 1.7 раза быстрее llama.cpp**.
+
+### Возможности
+
+| Подсистема | Что реализовано |
+|---|---|
+| GGUF v3 | Парсер заголовка, метаданных и дескрипторов; ленивое чтение данных из файла |
+| Квантование | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K–Q6_K — деквантовщики портированы с эталонного C-кода ggml |
+| Математика | Развёрнутый `dot`, AVX/SSE4.1 SIMD-ядра, RMSNorm, стабильный softmax, RoPE (LLaMA и NeoX), SwiGLU |
+| Трансформер | Блоки LLaMA, grouped-query attention, KV-кэш с геометрическим ростом, attention-биасы Qwen |
+| Токенизатор | BPE из GGUF-словаря, режимы SentencePiece и GPT-2/Qwen, явный список `merges`, byte-fallback `<0xXX>` |
+| Сэмплинг | greedy, temperature, top-k, top-p, min-p, repetition penalty, детерминированный xorshift64 |
+| Генерация | Префилл, потоковая выдача с корректным UTF-8, stop by EOS |
+| CUDA | JIT-компилируемый `matvec`, веса в VRAM, групповые запуски, SwiGLU на GPU |
+
+### Сборка
+
+```bash
+cd cortex
+cargo build --release
+cargo test
+cargo bench
+```
+
+### Использование
+
+```rust,no_run
+use cortex::{Engine, GenerateConfig, LoadOptions};
+
+let mut engine = Engine::load("model.gguf", LoadOptions::default())?;
+let cfg = GenerateConfig {
+    max_tokens: 64,
+    temperature: 0.8,
+    top_k: 40,
+    top_p: 0.9,
+    ..Default::default()
+};
+let out = engine.generate("Hello", &cfg, |_id, piece| print!("{piece}"))?;
+println!("\n{} токенов", out.token_count);
+# Ok::<(), cortex::Error>(())
+```
+
+CLI:
+
+```bash
+cargo run --release --example generate -- \
+  models/Llama-3.2-1B-Instruct-Q4_K_M.gguf "Once upon a time" \
+  --temp 0.8 --top-p 0.9 --max 128 --seed 42 --threads 8
+
+cargo run --release --example info -- model.gguf
+cargo run --release --example tokens -- model.gguf "Hello world"
+cargo run --release --example bench -- model.gguf "Once upon a time" 64 --threads 8
+```
+
+GPU:
+
+```bash
+cargo run --release --example generate -- model.gguf "Hello" --device cuda
+cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
+```
+
+Дизайн и замеры CUDA-бэкенда: [README_CUDA.md](README_CUDA.md).
+
+### Производительность
+
+`Qwen2.5-0.5B-Instruct-Q4_K_M`, RTX 2060, 8 потоков где применимо:
+
+| Конфигурация | Скорость |
+|---|---|
+| **Cortex CUDA** | **~41–42 ток/с** |
+| llama.cpp b12755, CPU, 8 потоков | ~24 ток/с |
+| Cortex CPU, Lazy + SIMD | ~4–10 ток/с |
+
+Изначальная цель — обогнать llama.cpp на 15–20% — превышена с CUDA-бэкендом
+(~1.7×). CPU-оптимизации: AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K,
+деквантовка блоками в L1-буфер и постоянный пул потоков.
+
+### Тесты без модели
+
+Модуль `cortex::synthetic` генерирует крошечный валидный GGUF (2 слоя, dim 16,
+vocab 32), поэтому интеграционные тесты прогоняют весь конвейер без загрузки модели:
+
+```bash
+cargo test
+cargo run --release --example make_tiny -- /tmp/tiny.gguf
+```
+
+Структура исходников:
 
 ```
 src/
   quant/dequant.rs   деквантовка всех поддерживаемых GGML-типов
-  gguf/              бинарный формат контейнера
+  gguf/              парсер контейнера GGUF
   tensor.rs          Matrix, matvec, ленивая/жадная деквантовка
   tokenizer/bpe.rs   BPE и нормализация текста
-  model/
-    config.rs        гиперпараметры из метаданных
-    attention.rs     RMSNorm, RoPE, softmax, SwiGLU
-    cache.rs         KV-кэш
-    weights.rs       загрузка тензоров
-    llama.rs         прямой проход transformer'а
+  model/             конфиг, ядра attention, KV-кэш, веса, forward pass
+  cuda.rs            FFI к CUDA Driver API, NVRTC JIT, GPU matvec
   sampler.rs         выбор следующего токена
   generate.rs        цикл генерации
   synthetic.rs       генератор тестовой модели
 ```
 
-## Ограничения
+### Ограничения
 
-- GGUF версии 3 только (актуальная версия llama.cpp).
-- Поддерживаются 1- и 2-мерные тензоры; MoE-архитектуры не реализованы.
-- Нет GPU, SIMD и многопоточности — чистый скалярный Rust. Это учебный и понятный код, а не рекордная скорость.
-- Некоторые экзотические кванты (IQ-*, TQ*) пока не поддерживаются.
+- Только GGUF версии 3.
+- Одномерные и двумерные тензоры; MoE не поддерживается.
+- CPU-путь — скалярный/SIMD Rust: GPU не нужен, но скорость ниже, чем у C++.
+- CUDA-путь хранит f32-веса в VRAM: модель 7B требует ~28 ГБ.
+- Экзотические кванты (IQ-*, TQ*) не реализованы.
+- Архитектуры вне LLaMA/Qwen2-подобных трансформеров (например Gemma 4) не поддерживаются.
 
-## Лицензия
+### Лицензия
 
-MIT OR Apache-2.0 на выбор.
+Двойная лицензия: [MIT](LICENSE-MIT) или [Apache-2.0](LICENSE-APACHE) на выбор.
