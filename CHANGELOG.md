@@ -22,7 +22,7 @@ First public release. / Первый публичный релиз.
 
 | Model / Модель | Cortex CPU | Cortex CUDA | llama.cpp CPU | llama.cpp CUDA |
 |---|---|---|---|---|
-| Qwen2.5-0.5B Q4_K_M | ~10 tok/s | ~42 tok/s | ~24 tok/s | ~338 tok/s |
+| Qwen2.5-0.5B Q4_K_M | ~10 tok/s | ~200 tok/s | ~24 tok/s | ~338 tok/s |
 | Gemma 4 E4B Q4_K_XL | ~0.27 tok/s | ~4.1 tok/s | — | ~3.1 tok/s |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for methodology and caveats.

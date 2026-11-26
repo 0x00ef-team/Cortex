@@ -41,9 +41,16 @@ type CuMemFree = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
 type CuLaunchKernel = unsafe extern "C" fn(
-    u64, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut c_void,
+    u64, u32, u32, u32, u32, u32, u32, u32, u64, *mut *mut c_void, *mut c_void,
 ) -> i32;
 type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+type CuStreamCreate = unsafe extern "C" fn(*mut u64, u32) -> i32;
+type CuStreamBeginCapture = unsafe extern "C" fn(u64, u32) -> i32;
+type CuStreamEndCapture = unsafe extern "C" fn(u64, *mut u64) -> i32;
+type CuGraphInstantiate = unsafe extern "C" fn(*mut u64, u64, *mut u64, *mut c_char, usize) -> i32;
+type CuGraphLaunch = unsafe extern "C" fn(u64, u64) -> i32;
+type CuStreamSynchronize = unsafe extern "C" fn(u64) -> i32;
+type CuMemcpyHtoDAsync = unsafe extern "C" fn(u64, *const c_void, usize, u64) -> i32;
 
 type NvrtcCreateProgram = unsafe extern "C" fn(
     *mut u64,
@@ -61,6 +68,8 @@ type NvrtcGetProgramLog = unsafe extern "C" fn(u64, *mut c_char) -> i32;
 type NvrtcDestroyProgram = unsafe extern "C" fn(*mut u64) -> i32;
 
 const MATVEC_KERNEL: &str = r#"
+#include <cuda_fp16.h>
+
 extern "C" __global__ void matvec_f32(
     const float* __restrict__ W,
     const float* __restrict__ x,
@@ -153,12 +162,12 @@ extern "C" __global__ void matvec_q4_k(
     const unsigned char* __restrict__ W, const float* __restrict__ x,
     float* __restrict__ y, int rows, int cols)
 {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned char* row = W + (size_t) r * ((cols / 256) * 144);
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    const unsigned char* row = W + (size_t) r * (((cols + 255) / 256) * 144);
     float sum = 0.f;
-    int c = 0;
-    for (int b = 0; b < cols / 256; ++b) {
+    for (int b = tid; b < ((cols + 255) / 256); b += blockDim.x) {
+        int c = b * 256;
         const unsigned char* blk = row + b * 144;
         float d = cortex_h2f(ld16(blk));
         float dm = cortex_h2f(ld16(blk + 2));
@@ -178,19 +187,26 @@ extern "C" __global__ void matvec_q4_k(
             q += 32; is += 2; c += 64;
         }
     }
-    y[r] = sum;
+    __shared__ float acc[128];
+    acc[tid] = sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = acc[0];
 }
 
 extern "C" __global__ void matvec_q6_k(
     const unsigned char* __restrict__ W, const float* __restrict__ x,
     float* __restrict__ y, int rows, int cols)
 {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned char* row = W + (size_t) r * ((cols / 256) * 210);
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    const unsigned char* row = W + (size_t) r * (((cols + 255) / 256) * 210);
     float sum = 0.f;
-    int c = 0;
-    for (int b = 0; b < cols / 256; ++b) {
+    for (int b = tid; b < ((cols + 255) / 256); b += blockDim.x) {
+        int c = b * 256;
         const unsigned char* blk = row + b * 210;
         float d = cortex_h2f(ld16(blk + 208));
         const unsigned char* ql = blk;
@@ -214,19 +230,26 @@ extern "C" __global__ void matvec_q6_k(
             c += 128;
         }
     }
-    y[r] = sum;
+    __shared__ float acc[128];
+    acc[tid] = sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = acc[0];
 }
 
 extern "C" __global__ void matvec_q5_k(
     const unsigned char* __restrict__ W, const float* __restrict__ x,
     float* __restrict__ y, int rows, int cols)
 {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned char* row = W + (size_t) r * ((cols / 256) * 176);
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    const unsigned char* row = W + (size_t) r * (((cols + 255) / 256) * 176);
     float sum = 0.f;
-    int c = 0;
-    for (int b = 0; b < cols / 256; ++b) {
+    for (int b = tid; b < ((cols + 255) / 256); b += blockDim.x) {
+        int c = b * 256;
         const unsigned char* blk = row + b * 176;
         float d = cortex_h2f(ld16(blk));
         float dm = cortex_h2f(ld16(blk + 2));
@@ -251,25 +274,71 @@ extern "C" __global__ void matvec_q5_k(
             u1 <<= 2; u2 <<= 2;
         }
     }
-    y[r] = sum;
+    __shared__ float acc[128];
+    acc[tid] = sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = acc[0];
+}
+
+extern "C" __global__ void matvec_q5_0(
+    const unsigned char* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    const unsigned char* row = W + (size_t) r * (((cols + 31) / 32) * 22);
+    float sum = 0.f;
+    for (int b = tid; b < ((cols + 31) / 32); b += blockDim.x) {
+        const unsigned char* blk = row + b * 22;
+        float d = cortex_h2f(ld16(blk));
+        unsigned int qh = (unsigned int) blk[2] | ((unsigned int) blk[3] << 8)
+                        | ((unsigned int) blk[4] << 16) | ((unsigned int) blk[5] << 24);
+        for (int j = 0; j < 16; ++j) {
+            unsigned int xh0 = ((qh >> j) << 4) & 16u;
+            unsigned int xh1 = (qh >> (j + 12)) & 16u;
+            float q0 = (float)((int)((blk[6 + j] & 15) | xh0) - 16);
+            float q1 = (float)((int)((blk[6 + j] >> 4) | xh1) - 16);
+            sum += q0 * d * x[b * 32 + j];
+            sum += q1 * d * x[b * 32 + 16 + j];
+        }
+    }
+    __shared__ float acc[128];
+    acc[tid] = sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = acc[0];
 }
 
 extern "C" __global__ void matvec_q8_0(
     const unsigned char* __restrict__ W, const float* __restrict__ x,
     float* __restrict__ y, int rows, int cols)
 {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned char* row = W + (size_t) r * ((cols / 32) * 34);
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+    const unsigned char* row = W + (size_t) r * (((cols + 31) / 32) * 34);
     float sum = 0.f;
-    for (int b = 0; b < cols / 32; ++b) {
+    for (int b = tid; b < ((cols + 31) / 32); b += blockDim.x) {
         const unsigned char* blk = row + b * 34;
         float d = cortex_h2f(ld16(blk));
         for (int l = 0; l < 32; ++l) {
             sum += ((signed char) blk[2 + l]) * d * x[b * 32 + l];
         }
     }
-    y[r] = sum;
+    __shared__ float acc[128];
+    acc[tid] = sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) y[r] = acc[0];
 }
 
 extern "C" __global__ void matvec_f16(
@@ -295,11 +364,170 @@ extern "C" __global__ void swiglu_kernel(
     float g = gate[i];
     out[i] = (g / (1.0f + expf(-g))) * up[i];
 }
+
+extern "C" // 8 rows per block, one warp per row: coalesced x loads and only rows/8
+// blocks for the very tall output head.
+extern "C" __global__ void matvec_f32_rows(
+    const float* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * 8 + threadIdx.x / 32;
+    if (r >= rows) return;
+    int lane = threadIdx.x & 31;
+    const float* row = W + (size_t) r * cols;
+    float sum = 0.f;
+    for (int c = lane * 4; c + 4 <= cols; c += 128) {
+        float4 wv = *(const float4*) (row + c);
+        float4 xv = *(const float4*) (x + c);
+        sum += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) y[r] = sum;
+}
+
+extern "C" extern "C" __global__ void matvec_f16_rows(
+    const unsigned short* __restrict__ W, const float* __restrict__ x,
+    float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * 8 + threadIdx.x / 32;
+    if (r >= rows) return;
+    int lane = threadIdx.x & 31;
+    const unsigned short* row = W + (size_t) r * cols;
+    float sum = 0.f;
+    for (int c = lane * 2; c + 2 <= cols; c += 64) {
+        float2 wv = __half22float2(*(const __half2*) (row + c));
+        float2 xv = *(const float2*) (x + c);
+        sum += wv.x * xv.x + wv.y * xv.y;
+    }
+    if (cols % 2 != 0 && lane == 0) sum += __half2float(__ushort_as_half(row[cols - 1])) * x[cols - 1];
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) y[r] = sum;
+}
+
+extern "C" __global__ void cortex_rmsnorm(
+    const float* __restrict__ x, const float* __restrict__ w,
+    float* __restrict__ y, int n, float eps)
+{
+    __shared__ float acc[256];
+    int tid = threadIdx.x;
+    float s = 0.f;
+    for (int i = tid; i < n; i += blockDim.x) s += x[i] * x[i];
+    acc[tid] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) acc[tid] += acc[tid + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(acc[0] / (float) n + eps);
+    for (int i = tid; i < n; i += blockDim.x) y[i] = x[i] * scale * w[i];
+}
+
+extern "C" __global__ void cortex_rope_qk(
+    float* __restrict__ q, float* __restrict__ k,
+    const float* __restrict__ cos, const float* __restrict__ sin,
+    int q_heads, int kv_heads, int hd)
+{
+    int half = hd / 2;
+    int total = (q_heads + kv_heads) * half;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    int head = tid / half;
+    int i = tid % half;
+    float* base = head < q_heads ? q + head * hd : k + (head - q_heads) * hd;
+    float a = base[i], b = base[i + half];
+    float c = cos[i], s = sin[i];
+    base[i] = a * c - b * s;
+    base[i + half] = b * c + a * s;
+}
+
+extern "C" __global__ void cortex_append_kv(
+    float* __restrict__ kc, float* __restrict__ vc,
+    const float* __restrict__ k, const float* __restrict__ v,
+    const int* __restrict__ pos_p, int width)
+{
+    int pos = *pos_p;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    kc[(size_t) pos * width + i] = k[i];
+    vc[(size_t) pos * width + i] = v[i];
+}
+
+extern "C" __global__ void cortex_add_bias(float* __restrict__ x, const float* __restrict__ b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += b[i];
+}
+
+extern "C" __global__ void cortex_add(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ y, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void cortex_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ kc, const float* __restrict__ vc,
+    float* __restrict__ out,
+    const int* __restrict__ pos_p, int n_heads, int n_kv, int hd, int width, int window)
+{
+    int pos = *pos_p;
+    extern __shared__ float share[];
+    float* scores = share;
+    int h = blockIdx.x;
+    int kv_head = h / (n_heads / n_kv);
+    const float* qh = q + h * hd;
+    int start = window > 0 ? max(0, pos - window + 1) : 0;
+    int count = pos - start + 1;
+    int tid = threadIdx.x;
+    for (int t = start + tid; t <= pos; t += blockDim.x) {
+        const float* kh = kc + (size_t) t * width + kv_head * hd;
+        float s = 0.f;
+        for (int d = 0; d < hd; ++d) s += qh[d] * kh[d];
+        scores[t - start] = s * rsqrtf((float) hd);
+    }
+    __syncthreads();
+    float local_max = -1e30f;
+    for (int i = tid; i < count; i += blockDim.x) local_max = fmaxf(local_max, scores[i]);
+    share[512 + tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) share[512 + tid] = fmaxf(share[512 + tid], share[512 + tid + stride]);
+        __syncthreads();
+    }
+    float mx = share[512];
+    if (tid == 0) share[640] = 0.f;
+    __syncthreads();
+    float local_sum = 0.f;
+    for (int i = tid; i < count; i += blockDim.x) {
+        float e = __expf(scores[i] - mx);
+        scores[i] = e;
+        local_sum += e;
+    }
+    atomicAdd(&share[640], local_sum);
+    __syncthreads();
+    float inv = 1.f / fmaxf(share[640], 1e-20f);
+    float* oh = out + h * hd;
+    for (int d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.f;
+        for (int t = start; t <= pos; ++t) {
+            const float* vh = vc + (size_t) t * width + kv_head * hd;
+            acc += scores[t - start] * inv * vh[d];
+        }
+        oh[d] = acc;
+    }
+}
 "#;
 
 /// A buffer allocated in device memory.
 pub struct CudaBuffer {
     ptr: u64,
+}
+
+impl CudaBuffer {
+    pub fn ptr(&self) -> u64 {
+        self.ptr
+    }
 }
 
 impl Drop for CudaBuffer {
@@ -329,8 +557,25 @@ struct Api {
     q6k: u64,
     q5k: u64,
     q8_0: u64,
+    q5_0: u64,
     f16: u64,
+    f32_rows: u64,
+    f16_rows: u64,
     swiglu: u64,
+    norm: u64,
+    rope: u64,
+    append: u64,
+    add: u64,
+    bias: u64,
+    attn: u64,
+    stream: u64,
+    graph: Mutex<Option<u64>>,
+    begin: CuStreamBeginCapture,
+    end: CuStreamEndCapture,
+    graph_inst: CuGraphInstantiate,
+    graph_launch: CuGraphLaunch,
+    stream_sync: CuStreamSynchronize,
+    memcpy_async: CuMemcpyHtoDAsync,
     cu_mem_alloc: CuMemAlloc,
     cu_memcpy_h2d: CuMemcpyHtoD,
     cu_memcpy_d2h: CuMemcpyDtoH,
@@ -391,6 +636,13 @@ impl CudaDevice {
             let cu_memcpy_d2h: CuMemcpyDtoH = ffi!(cuda, "cuMemcpyDtoH_v2", CuMemcpyDtoH);
             let cu_launch: CuLaunchKernel = ffi!(cuda, "cuLaunchKernel", CuLaunchKernel);
             let cu_sync: CuCtxSynchronize = ffi!(cuda, "cuCtxSynchronize", CuCtxSynchronize);
+            let cu_stream_create: CuStreamCreate = ffi!(cuda, "cuStreamCreate", CuStreamCreate);
+            let cu_begin: CuStreamBeginCapture = ffi!(cuda, "cuStreamBeginCapture", CuStreamBeginCapture);
+            let cu_end: CuStreamEndCapture = ffi!(cuda, "cuStreamEndCapture", CuStreamEndCapture);
+            let cu_graph_inst: CuGraphInstantiate = ffi!(cuda, "cuGraphInstantiate", CuGraphInstantiate);
+            let cu_graph_launch: CuGraphLaunch = ffi!(cuda, "cuGraphLaunch", CuGraphLaunch);
+            let cu_stream_sync: CuStreamSynchronize = ffi!(cuda, "cuStreamSynchronize", CuStreamSynchronize);
+            let cu_memcpy_async: CuMemcpyHtoDAsync = ffi!(cuda, "cuMemcpyHtoDAsync_v2", CuMemcpyHtoDAsync);
 
             let nvrtc_create: NvrtcCreateProgram = ffi!(nvrtc, "nvrtcCreateProgram", NvrtcCreateProgram);
             let nvrtc_compile: NvrtcCompileProgram = ffi!(nvrtc, "nvrtcCompileProgram", NvrtcCompileProgram);
@@ -414,7 +666,9 @@ impl CudaDevice {
                 nvrtc_create(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()),
                 "nvrtcCreateProgram",
             )?;
-            let compile = nvrtc_compile(prog, 0, std::ptr::null());
+            let inc = CString::new("--include-path=/usr/include").unwrap();
+            let opts = [inc.as_ptr()];
+            let compile = nvrtc_compile(prog, 1, opts.as_ptr());
             if compile != CUDA_SUCCESS {
                 let mut size = 0usize;
                 nvrtc_log_size(prog, &mut size);
@@ -450,12 +704,43 @@ impl CudaDevice {
             let mut kq8 = 0u64;
             let n = CString::new("matvec_q8_0").unwrap();
             check(cu_module_fn(&mut kq8, module, n.as_ptr()), "fn q8_0")?;
+            let mut kq50 = 0u64;
+            let n = CString::new("matvec_q5_0").unwrap();
+            check(cu_module_fn(&mut kq50, module, n.as_ptr()), "fn q5_0")?;
             let mut kf16 = 0u64;
             let n = CString::new("matvec_f16").unwrap();
             check(cu_module_fn(&mut kf16, module, n.as_ptr()), "fn f16")?;
+            let mut hrows = 0u64;
+            let n = CString::new("matvec_f32_rows").unwrap();
+            check(cu_module_fn(&mut hrows, module, n.as_ptr()), "fn rows")?;
+            let mut hf16r = 0u64;
+            let n = CString::new("matvec_f16_rows").unwrap();
+            check(cu_module_fn(&mut hf16r, module, n.as_ptr()), "fn f16_rows")?;
+            let mut hnorm = 0u64;
+            let n = CString::new("cortex_rmsnorm").unwrap();
+            check(cu_module_fn(&mut hnorm, module, n.as_ptr()), "fn norm")?;
+            let mut hrope = 0u64;
+            let n = CString::new("cortex_rope_qk").unwrap();
+            check(cu_module_fn(&mut hrope, module, n.as_ptr()), "fn rope")?;
+            let mut happ = 0u64;
+            let n = CString::new("cortex_append_kv").unwrap();
+            check(cu_module_fn(&mut happ, module, n.as_ptr()), "fn append")?;
+            let mut hbias = 0u64;
+            let n = CString::new("cortex_add_bias").unwrap();
+            check(cu_module_fn(&mut hbias, module, n.as_ptr()), "fn bias")?;
+            let mut hadd = 0u64;
+            let n = CString::new("cortex_add").unwrap();
+            check(cu_module_fn(&mut hadd, module, n.as_ptr()), "fn add")?;
+            let mut hatt = 0u64;
+            let n = CString::new("cortex_attention").unwrap();
+            check(cu_module_fn(&mut hatt, module, n.as_ptr()), "fn attn")?;
             let swname = CString::new("swiglu_kernel").unwrap();
             let mut swiglu = 0u64;
             check(cu_module_fn(&mut swiglu, module, swname.as_ptr()), "cuModuleGetFunction(swiglu)")?;
+
+            let mut stream = 0u64;
+            check(cu_stream_create(&mut stream, 0), "cuStreamCreate")?;
+            if std::env::var_os("CORTEX_CUDA_DEBUG").is_some() { eprintln!("stream={stream}, ctx={ctx}, device={device}"); }
 
             LETS_FREE = std::mem::transmute::<CuMemFree, fn(u64)>(cu_mem_free);
 
@@ -467,8 +752,25 @@ impl CudaDevice {
                     q6k: kq6,
                     q5k: kq5,
                     q8_0: kq8,
+                    q5_0: kq50,
                     f16: kf16,
+                    f32_rows: hrows,
+                    f16_rows: hf16r,
                     swiglu,
+                    norm: hnorm,
+                    rope: hrope,
+                    append: happ,
+                    add: hadd,
+                    bias: hbias,
+                    attn: hatt,
+                    stream,
+                    graph: Mutex::new(None),
+                    begin: cu_begin,
+                    end: cu_end,
+                    graph_inst: cu_graph_inst,
+                    graph_launch: cu_graph_launch,
+                    stream_sync: cu_stream_sync,
+                    memcpy_async: cu_memcpy_async,
                     cu_mem_alloc,
                     cu_memcpy_h2d,
                     cu_memcpy_d2h,
@@ -494,6 +796,334 @@ impl CudaDevice {
             )?;
         }
         Ok(CudaBuffer { ptr })
+    }
+
+    /// Allocate an uninitialized device buffer of `len` floats.
+    pub fn alloc(&self, len: usize) -> Result<CudaBuffer> {
+        let mut ptr = 0u64;
+        unsafe {
+            check(
+                (self.api.cu_mem_alloc)(&mut ptr, len * 4),
+                "cuMemAlloc",
+            )?;
+        }
+        Ok(CudaBuffer { ptr })
+    }
+
+    pub fn copy_to_device(&self, dst: &CudaBuffer, src: &[f32]) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.cu_memcpy_h2d)(dst.ptr, src.as_ptr() as *const c_void, src.len() * 4),
+                "cuMemcpyHtoD",
+            )
+        }
+    }
+
+    pub fn copy_to_host(&self, dst: &mut [f32], src: &CudaBuffer) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.cu_memcpy_d2h)(dst.as_mut_ptr() as *mut c_void, src.ptr, dst.len() * 4),
+                "cuMemcpyDtoH",
+            )
+        }
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe { check((self.api.cu_sync)(), "cuCtxSynchronize") }
+    }
+
+    pub fn copy_to_device_async(&self, dst: &CudaBuffer, src: &[f32]) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len() * 4, self.api.stream),
+                "cuMemcpyHtoDAsync",
+            )
+        }
+    }
+
+    pub fn copy_bytes_to_device_async(&self, dst: &CudaBuffer, src: &[u8]) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.memcpy_async)(dst.ptr, src.as_ptr() as *const c_void, src.len(), self.api.stream),
+                "cuMemcpyHtoDAsync(bytes)",
+            )
+        }
+    }
+
+    pub fn graph_begin(&self) -> Result<()> {
+        unsafe { check((self.api.begin)(self.api.stream, 0), "cuStreamBeginCapture") }
+    }
+
+    pub fn graph_end(&self) -> Result<()> {
+        let mut graph = 0u64;
+        unsafe {
+            check((self.api.end)(self.api.stream, &mut graph), "cuStreamEndCapture")?;
+            let mut exec = 0u64;
+            check(
+                (self.api.graph_inst)(&mut exec, graph, std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                "cuGraphInstantiate",
+            )?;
+            *self.api.graph.lock().unwrap() = Some(exec);
+        }
+        Ok(())
+    }
+
+    pub fn graph_ready(&self) -> bool {
+        self.api.graph.lock().unwrap().is_some()
+    }
+
+    pub fn graph_launch(&self) -> Result<()> {
+        let exec = self.api.graph.lock().unwrap().unwrap();
+        unsafe { check((self.api.graph_launch)(exec, self.api.stream), "cuGraphLaunch") }
+    }
+
+    pub fn stream_sync(&self) -> Result<()> {
+        unsafe { check((self.api.stream_sync)(self.api.stream), "cuStreamSynchronize") }
+    }
+
+    pub fn rmsnorm_device(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        y: &CudaBuffer,
+        n: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let mut p: [*mut c_void; 5] = [
+            &x.ptr as *const u64 as *mut c_void,
+            &w.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &(n as i32) as *const i32 as *mut c_void,
+            &eps as *const f32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.norm, 1, 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch rmsnorm",
+            )
+        }
+    }
+
+    pub fn rope_device(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        cos: &CudaBuffer,
+        sin: &CudaBuffer,
+        q_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Result<()> {
+        let total = (q_heads + kv_heads) * (hd / 2);
+        let mut p: [*mut c_void; 7] = [
+            &q.ptr as *const u64 as *mut c_void,
+            &k.ptr as *const u64 as *mut c_void,
+            &cos.ptr as *const u64 as *mut c_void,
+            &sin.ptr as *const u64 as *mut c_void,
+            &(q_heads as i32) as *const i32 as *mut c_void,
+            &(kv_heads as i32) as *const i32 as *mut c_void,
+            &(hd as i32) as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.rope, (total as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch rope",
+            )
+        }
+    }
+
+    pub fn append_kv_device(
+        &self,
+        kc: &CudaBuffer,
+        vc: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        pos: &CudaBuffer,
+        width: usize,
+    ) -> Result<()> {
+        let mut p: [*mut c_void; 6] = [
+            &kc.ptr as *const u64 as *mut c_void,
+            &vc.ptr as *const u64 as *mut c_void,
+            &k.ptr as *const u64 as *mut c_void,
+            &v.ptr as *const u64 as *mut c_void,
+            &pos.ptr as *const u64 as *mut c_void,
+            &(width as i32) as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.append, (width as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch append_kv",
+            )
+        }
+    }
+
+    pub fn add_bias_device(&self, x: &CudaBuffer, b: &CudaBuffer, n: usize) -> Result<()> {
+        let mut p: [*mut c_void; 3] = [
+            &x.ptr as *const u64 as *mut c_void,
+            &b.ptr as *const u64 as *mut c_void,
+            &(n as i32) as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.bias, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch add_bias",
+            )
+        }
+    }
+
+    pub fn add_device(&self, a: &CudaBuffer, b: &CudaBuffer, y: &CudaBuffer, n: usize) -> Result<()> {
+        let mut p: [*mut c_void; 4] = [
+            &a.ptr as *const u64 as *mut c_void,
+            &b.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &(n as i32) as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.add, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch add",
+            )
+        }
+    }
+
+    pub fn attention_device(
+        &self,
+        q: &CudaBuffer,
+        kc: &CudaBuffer,
+        vc: &CudaBuffer,
+        out: &CudaBuffer,
+        pos: &CudaBuffer,
+        n_heads: usize,
+        n_kv: usize,
+        hd: usize,
+        width: usize,
+        window: usize,
+    ) -> Result<()> {
+        let mut p: [*mut c_void; 10] = [
+            &q.ptr as *const u64 as *mut c_void,
+            &kc.ptr as *const u64 as *mut c_void,
+            &vc.ptr as *const u64 as *mut c_void,
+            &out.ptr as *const u64 as *mut c_void,
+            &pos.ptr as *const u64 as *mut c_void,
+            &(n_heads as i32) as *const i32 as *mut c_void,
+            &(n_kv as i32) as *const i32 as *mut c_void,
+            &(hd as i32) as *const i32 as *mut c_void,
+            &(width as i32) as *const i32 as *mut c_void,
+            &(window as i32) as *const i32 as *mut c_void,
+        ];
+        // 512 scores + max + sum slots
+        let shared = (512 + 128 + 1) * 4;
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.attn, n_heads as u32, 1, 1, 128, 1, 1, shared, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch attention",
+            )
+        }
+    }
+
+    pub fn swiglu_device(&self, gate: &CudaBuffer, up: &CudaBuffer, out: &CudaBuffer, n: usize) -> Result<()> {
+        let mut p: [*mut c_void; 4] = [
+            &gate.ptr as *const u64 as *mut c_void,
+            &up.ptr as *const u64 as *mut c_void,
+            &out.ptr as *const u64 as *mut c_void,
+            &(n as i32) as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.swiglu, (n as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch swiglu",
+            )
+        }
+    }
+
+    /// Launch a quantized matvec kernel without synchronizing.
+    pub fn matvec_q_device(
+        &self,
+        w: &QuantBuffer,
+        x: &CudaBuffer,
+        y: &CudaBuffer,
+    ) -> Result<()> {
+        let func = match w.kind {
+            12 => self.api.q4k,
+            14 => self.api.q6k,
+            13 => self.api.q5k,
+            8 => self.api.q8_0,
+            6 => self.api.q5_0,
+            1 => self.api.f16,
+            0 => self.api.function,
+            other => return Err(Error::InvalidConfig(format!("CUDA: unsupported type {other}"))),
+        };
+        let rows = w.rows as i32;
+        let cols = w.cols as i32;
+        let mut p: [*mut c_void; 5] = [
+            &w.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &rows as *const i32 as *mut c_void,
+            &cols as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(func, w.rows as u32, 1, 1, 128, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch quantized matvec",
+            )
+        }
+    }
+
+    /// Launch the f32 matvec kernel without synchronizing (uses `matvec_f32`).
+    /// Coalesced block-per-row f32 matvec (for the very tall output head).
+    pub fn matvec_f16_rows_device(&self, w: &QuantBuffer, x: &CudaBuffer, y: &CudaBuffer) -> Result<()> {
+        let r = w.rows as i32;
+        let c = w.cols as i32;
+        let mut p: [*mut c_void; 5] = [
+            &w.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &r as *const i32 as *mut c_void,
+            &c as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.f16_rows, (w.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch f16 rows",
+            )
+        }
+    }
+
+    pub fn matvec_f32_tall_device(&self, w: &CudaBuffer, x: &CudaBuffer, y: &CudaBuffer, rows: usize, cols: usize) -> Result<()> {
+        let r = rows as i32;
+        let c = cols as i32;
+        let mut p: [*mut c_void; 5] = [
+            &w.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &r as *const i32 as *mut c_void,
+            &c as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.f32_rows, (rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch tall matvec",
+            )
+        }
+    }
+
+    pub fn matvec_f32_device(&self, w: &CudaBuffer, x: &CudaBuffer, y: &CudaBuffer, rows: usize, cols: usize) -> Result<()> {
+        let r = rows as i32;
+        let c = cols as i32;
+        let mut p: [*mut c_void; 5] = [
+            &w.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &y.ptr as *const u64 as *mut c_void,
+            &r as *const i32 as *mut c_void,
+            &c as *const i32 as *mut c_void,
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.function, (rows as u32).div_ceil(256), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch f32 matvec",
+            )
+        }
     }
 
     /// `(total nanoseconds, number of calls)` spent in `matvec` so far.
@@ -571,7 +1201,7 @@ impl CudaDevice {
                         1,
                         1,
                         0,
-                        std::ptr::null_mut(),
+                        self.api.stream,
                         params.as_mut_ptr(),
                         std::ptr::null_mut(),
                     ),
@@ -646,7 +1276,7 @@ impl CudaDevice {
                     1,
                     1,
                     0,
-                    std::ptr::null_mut(),
+                    self.api.stream,
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
@@ -732,9 +1362,9 @@ impl CudaDevice {
             check(
                 (self.api.cu_launch)(
                     func,
-                    (w.rows as u32).div_ceil(256),
-                    1, 1, 256, 1, 1, 0,
-                    std::ptr::null_mut(),
+                    w.rows as u32,
+                    1, 1, 128, 1, 1, 0,
+                    self.api.stream,
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
@@ -807,7 +1437,7 @@ impl CudaDevice {
                         self.api.function,
                         (rows as u32).div_ceil(threads),
                         1, 1, threads, 1, 1, 0,
-                        std::ptr::null_mut(),
+                        self.api.stream,
                         params.as_mut_ptr(),
                         std::ptr::null_mut(),
                     ),
@@ -828,7 +1458,7 @@ impl CudaDevice {
                     self.api.swiglu,
                     (ffn_len as u32).div_ceil(threads),
                     1, 1, threads, 1, 1, 0,
-                    std::ptr::null_mut(),
+                    self.api.stream,
                     sp.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),

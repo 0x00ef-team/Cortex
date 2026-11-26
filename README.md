@@ -19,7 +19,7 @@ external dependencies** for the CPU path — no `ndarray`, no `candle`, no
 It runs LLaMA-family GGUF models (LLaMA 2/3, Mistral, Qwen2, CodeLlama, etc.)
 and **Gemma 4** dense text models, including quantized weights, and offers an
 optional CUDA backend that is ~1.7× faster than llama.cpp **CPU** on the test
-machine (but ~8× slower than llama.cpp CUDA). GGUF files are memory-mapped, so
+machine (but ~1.7× slower than llama.cpp CUDA). GGUF files are memory-mapped, so
 loading a 4.8 GB model takes ~0.5 s. The local crate in `Cargo.toml` is named
 `cortex-llm` (not published to crates.io yet); the library is imported as
 `cortex`.
@@ -95,13 +95,13 @@ See [README_CUDA.md](README_CUDA.md) for the CUDA backend design and benchmarks.
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~41–42 tok/s** |
+| **Cortex CUDA** | **~200 tok/s** |
 | llama.cpp b12755, CUDA, 8 threads | ~338 tok/s |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CPU, Lazy + SIMD | ~4–10 tok/s |
 
 The original goal of beating llama.cpp **CPU** by 15–20% is exceeded (~1.7×),
-but llama.cpp CUDA is still ~8× faster. CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
+but llama.cpp CUDA is still ~1.7× faster. CPU optimizations include AVX `dot`, fused Q8_0/Q5_0/Q4_K/Q6_K
 kernels, block-wise dequantization into an L1-resident buffer, and a persistent
 thread pool.
 
@@ -233,7 +233,7 @@ cargo run --release --example bench -- model.gguf "Hello" 64 --device cuda
 
 | Конфигурация | Скорость |
 |---|---|
-| **Cortex CUDA** | **~41–42 ток/с** |
+| **Cortex CUDA** | **~200 ток/с** |
 | llama.cpp b12755, CUDA, 8 потоков | ~338 ток/с |
 | llama.cpp b12755, CPU, 8 потоков | ~24 ток/с |
 | Cortex CPU, Lazy + SIMD | ~4–10 ток/с |

@@ -4,6 +4,7 @@ mod attention;
 mod cache;
 mod config;
 mod gemma4;
+mod gpu;
 mod llama;
 mod weights;
 

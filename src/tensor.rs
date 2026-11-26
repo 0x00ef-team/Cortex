@@ -191,6 +191,21 @@ impl Matrix {
         self.kind
     }
 
+    /// Raw compressed bytes for lazily stored matrices (no copy).
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        match &self.storage {
+            Storage::Raw { .. } => Some(self.as_raw_bytes()),
+            Storage::F32(_) => None,
+        }
+    }
+
+    fn as_raw_bytes(&self) -> &[u8] {
+        match &self.storage {
+            Storage::Raw { bytes, .. } => bytes.as_slice(),
+            _ => unreachable!(),
+        }
+    }
+
     /// Returns the expanded weights if the matrix is stored as `f32`.
     pub fn as_f32(&self) -> Option<&[f32]> {
         match &self.storage {

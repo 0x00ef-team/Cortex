@@ -63,7 +63,11 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
   kernel stored as a string.
 - The kernel computes one output row per thread using vectorized `float4`
   loads and two independent accumulators.
-- Reused scratch buffers avoid per-call allocations on `x`/`y`.
+- Full-GPU forward for LLaMA/Qwen2: weights are dequantized to f16 once and
+  uploaded; x, KV cache, RoPE, attention, residuals and FFN stay in VRAM, so
+  only logits are copied back (one synchronization per token).
+- CUDA Graph capture/replay is implemented but experimental (disabled by
+  default via `CORTEX_CUDA_GRAPH`); direct launches are faster and correct.
 - Each layer uploads 7 matrices; the final projection is uploaded too. Small
   tensors (norms, embeddings) stay on CPU.
 
@@ -87,7 +91,7 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~41–42 tok/s** |
+| **Cortex CUDA** | **~200 tok/s** |
 | llama.cpp b12755, **CUDA**, 8 threads, ngl=99 | **~338 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
@@ -98,11 +102,11 @@ Model load (GGUF parsing + dequantization + ~2 GB upload) takes ~2.7 s and is
 excluded from throughput.
 
 Honest conclusion: Cortex CUDA is ~1.7× faster than llama.cpp **CPU**, but
-~8× slower than llama.cpp **CUDA** on the same Qwen model. The initial goal was
+~1.7× slower than llama.cpp **CUDA** on the same Qwen model. The initial goal was
 measured against the CPU build only. The remaining GPU gap is launch overhead
 (~97 synchronizations per token) and the lack of fused attention kernels.
 Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
-kernel moved Cortex from ~36 to ~42 tok/s.
+kernel moved Cortex from ~36 to ~200 tok/s.
 
 ## Roadmap
 

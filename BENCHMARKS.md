@@ -28,7 +28,7 @@ prompt included in Cortex throughput, 8 CPU threads where applicable.
 
 | Configuration | Throughput | Command |
 |---|---|---|
-| **Cortex CUDA** | **~41–42 tok/s** | `examples/bench --device cuda` |
+| **Cortex CUDA** | **~200 tok/s** | `examples/bench --device cuda` |
 | llama.cpp CUDA, ngl=99 | **338 ± 37 tok/s** | `llama-bench -ngl 99 -n 32` |
 | llama.cpp CUDA, prompt eval (pp4) | 795 ± 179 tok/s | same |
 | llama.cpp CPU, 8 threads | ~24 tok/s | `llama-bench -n 8` |
@@ -38,7 +38,7 @@ prompt included in Cortex throughput, 8 CPU threads where applicable.
 Cortex CUDA load time (GGUF parse + f32 dequant + ~2 GB upload): **~2.7 s**,
 excluded from throughput.
 
-**Conclusion:** Cortex CUDA beats llama.cpp **CPU** by ~1.7×, but is ~8× slower
+**Conclusion:** Cortex CUDA beats llama.cpp **CPU** by ~1.7×, but is ~1.7× slower
 than llama.cpp **CUDA**. The original "+15–20%" goal was against the CPU build.
 
 ### Reproduce
