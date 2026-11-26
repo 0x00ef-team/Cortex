@@ -110,6 +110,7 @@ pub(crate) struct LlamaGpu {
     cos: CudaBuffer,
     sin: CudaBuffer,
     pos_dev: CudaBuffer,
+    calls: usize,
     n_embd: usize,
     n_ffn: usize,
     hd: usize,
@@ -209,6 +210,7 @@ impl LlamaGpu {
             cos,
             sin,
             pos_dev,
+            calls: 0,
             n_embd: n,
             n_ffn: cfg.n_ffn,
             hd,
@@ -261,7 +263,8 @@ impl LlamaGpu {
         self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
         // CUDA Graph replay is experimental and currently differs from the
         // direct path; keep direct launches as the default.
-        let use_graph = std::env::var_os("CORTEX_CUDA_GRAPH").is_some();
+        self.calls += 1;
+        let use_graph = std::env::var_os("CORTEX_CUDA_GRAPH").is_some() && self.calls >= 2;
         let capture = use_graph && !self.dev.graph_ready();
         if capture {
             self.dev.graph_begin()?;
@@ -271,9 +274,10 @@ impl LlamaGpu {
         let mut next = &self.x2;
         for (li, layer) in self.layers.iter().enumerate() {
             self.dev.rmsnorm_device(cur, &layer.attn_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
-            self.mv(&layer.wq, &self.xb, &self.q)?;
-            self.mv(&layer.wk, &self.xb, &self.k)?;
-            self.mv(&layer.wv, &self.xb, &self.v)?;
+            self.dev.matvec_qkv_device(
+                &layer.wq, &layer.wk, &layer.wv,
+                &self.xb, &self.q, &self.k, &self.v,
+            )?;
             if let Some(b) = &layer.bq {
                 self.dev.add_bias_device(&self.q, b, self.n_heads * self.hd)?;
             }
@@ -300,8 +304,9 @@ impl LlamaGpu {
             std::mem::swap(&mut cur, &mut next);
 
             self.dev.rmsnorm_device(cur, &layer.ffn_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
-            self.mv(&layer.gate, &self.xb, &self.gate)?;
-            self.mv(&layer.up, &self.xb, &self.up)?;
+            self.dev.matvec_gu_device(
+                &layer.gate, &layer.up, &self.xb, &self.gate, &self.up,
+            )?;
             self.dev.swiglu_device(&self.gate, &self.up, &self.act, self.n_ffn)?;
             self.mv(&layer.down, &self.act, &self.down)?;
             self.dev.add_device(cur, &self.down, next, self.n_embd)?;

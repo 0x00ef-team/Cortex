@@ -91,7 +91,7 @@ If CUDA is unavailable, use `Device::Cpu` (the default).
 
 | Configuration | Throughput |
 |---|---|
-| **Cortex CUDA** | **~200 tok/s** |
+| **Cortex CUDA** | **~210 tok/s** |
 | llama.cpp b12755, **CUDA**, 8 threads, ngl=99 | **~338 tok/s** |
 | llama.cpp b12755, CPU, 8 threads | ~24 tok/s |
 | Cortex CUDA, Gemma 4 E4B Q4_K_XL | ~4 tok/s |
@@ -106,7 +106,7 @@ Honest conclusion: Cortex CUDA is ~1.7× faster than llama.cpp **CPU**, but
 measured against the CPU build only. The remaining GPU gap is launch overhead
 (~97 synchronizations per token) and the lack of fused attention kernels.
 Grouped launches (q/k/v and gate/up/silu/down) and a coalesced output-head
-kernel moved Cortex from ~36 to ~200 tok/s.
+kernel moved Cortex from ~36 to ~210 tok/s.
 
 ## Roadmap
 

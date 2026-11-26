@@ -408,6 +408,60 @@ extern "C" extern "C" __global__ void matvec_f16_rows(
     if (lane == 0) y[r] = sum;
 }
 
+extern "C" __global__ void matvec_f16_qkv(
+    const unsigned short* WQ, const unsigned short* WK, const unsigned short* WV,
+    const float* x, float* q, float* k, float* v,
+    int q_rows, int kv_rows, int cols)
+{
+    int r = blockIdx.x * 8 + threadIdx.x / 32;
+    int total = q_rows + 2 * kv_rows;
+    if (r >= total) return;
+    int lane = threadIdx.x & 31;
+    const unsigned short* w;
+    float* out;
+    if (r < q_rows) { w = WQ; out = q; }
+    else if (r < q_rows + kv_rows) { w = WK + (size_t) (r - q_rows) * cols; out = k; }
+    else { w = WV + (size_t) (r - q_rows - kv_rows) * cols; out = v; }
+    if (r < q_rows) w = WQ + (size_t) r * cols;
+    float sum = 0.f;
+    for (int c = lane * 4; c + 4 <= cols; c += 128) {
+        float2 a = __half22float2(*(const __half2*) (w + c));
+        float2 b = __half22float2(*(const __half2*) (w + c + 2));
+        float2 xa = *(const float2*) (x + c);
+        float2 xb = *(const float2*) (x + c + 2);
+        sum += a.x * xa.x + a.y * xa.y + b.x * xb.x + b.y * xb.y;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) out[r < q_rows ? r : (r < q_rows + kv_rows ? r - q_rows : r - q_rows - kv_rows)] = sum;
+}
+
+extern "C" __global__ void matvec_f16_gu(
+    const unsigned short* WG, const unsigned short* WU,
+    const float* x, float* g, float* u, int rows, int cols)
+{
+    int r = blockIdx.x * 8 + threadIdx.x / 32;
+    if (r >= rows) return;
+    int lane = threadIdx.x & 31;
+    const unsigned short* wg = WG + (size_t) r * cols;
+    const unsigned short* wu = WU + (size_t) r * cols;
+    float sg = 0.f, su = 0.f;
+    for (int c = lane * 4; c + 4 <= cols; c += 128) {
+        float2 ag = __half22float2(*(const __half2*) (wg + c));
+        float2 bg = __half22float2(*(const __half2*) (wg + c + 2));
+        float2 au = __half22float2(*(const __half2*) (wu + c));
+        float2 bu = __half22float2(*(const __half2*) (wu + c + 2));
+        float2 xa = *(const float2*) (x + c);
+        float2 xb = *(const float2*) (x + c + 2);
+        sg += ag.x * xa.x + ag.y * xa.y + bg.x * xb.x + bg.y * xb.y;
+        su += au.x * xa.x + au.y * xa.y + bu.x * xb.x + bu.y * xb.y;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sg += __shfl_down_sync(0xffffffffu, sg, off);
+        su += __shfl_down_sync(0xffffffffu, su, off);
+    }
+    if (lane == 0) { g[r] = sg; u[r] = su; }
+}
+
 extern "C" __global__ void cortex_rmsnorm(
     const float* __restrict__ x, const float* __restrict__ w,
     float* __restrict__ y, int n, float eps)
@@ -565,6 +619,8 @@ struct Api {
     f16: u64,
     f32_rows: u64,
     f16_rows: u64,
+    qkv: u64,
+    gu: u64,
     swiglu: u64,
     norm: u64,
     rope: u64,
@@ -720,6 +776,12 @@ impl CudaDevice {
             let mut hf16r = 0u64;
             let n = CString::new("matvec_f16_rows").unwrap();
             check(cu_module_fn(&mut hf16r, module, n.as_ptr()), "fn f16_rows")?;
+            let mut hqkv = 0u64;
+            let n = CString::new("matvec_f16_qkv").unwrap();
+            check(cu_module_fn(&mut hqkv, module, n.as_ptr()), "fn qkv")?;
+            let mut hgu = 0u64;
+            let n = CString::new("matvec_f16_gu").unwrap();
+            check(cu_module_fn(&mut hgu, module, n.as_ptr()), "fn gu")?;
             let mut hnorm = 0u64;
             let n = CString::new("cortex_rmsnorm").unwrap();
             check(cu_module_fn(&mut hnorm, module, n.as_ptr()), "fn norm")?;
@@ -760,6 +822,8 @@ impl CudaDevice {
                     f16: kf16,
                     f32_rows: hrows,
                     f16_rows: hf16r,
+                    qkv: hqkv,
+                    gu: hgu,
                     swiglu,
                     norm: hnorm,
                     rope: hrope,
@@ -845,6 +909,15 @@ impl CudaDevice {
         }
     }
 
+    pub fn copy_bytes_to_device(&self, dst: &CudaBuffer, src: &[u8]) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.cu_memcpy_h2d)(dst.ptr, src.as_ptr() as *const c_void, src.len()),
+                "cuMemcpyHtoD(bytes)",
+            )
+        }
+    }
+
     pub fn copy_bytes_to_device_async(&self, dst: &CudaBuffer, src: &[u8]) -> Result<()> {
         unsafe {
             check(
@@ -855,7 +928,7 @@ impl CudaDevice {
     }
 
     pub fn graph_begin(&self) -> Result<()> {
-        unsafe { check((self.api.begin)(self.api.stream, 0), "cuStreamBeginCapture") }
+        unsafe { check((self.api.begin)(self.api.stream, 1), "cuStreamBeginCapture") }
     }
 
     pub fn graph_end(&self) -> Result<()> {
@@ -897,8 +970,8 @@ impl CudaDevice {
             &x.ptr as *const u64 as *mut c_void,
             &w.ptr as *const u64 as *mut c_void,
             &y.ptr as *const u64 as *mut c_void,
-            &(n as i32) as *const i32 as *mut c_void,
-            &eps as *const f32 as *mut c_void,
+            leak_i32(n as i32),
+            leak_f32(eps),
         ];
         unsafe {
             check(
@@ -924,9 +997,9 @@ impl CudaDevice {
             &k.ptr as *const u64 as *mut c_void,
             &cos.ptr as *const u64 as *mut c_void,
             &sin.ptr as *const u64 as *mut c_void,
-            &(q_heads as i32) as *const i32 as *mut c_void,
-            &(kv_heads as i32) as *const i32 as *mut c_void,
-            &(hd as i32) as *const i32 as *mut c_void,
+            leak_i32(q_heads as i32),
+            leak_i32(kv_heads as i32),
+            leak_i32(hd as i32),
         ];
         unsafe {
             check(
@@ -951,7 +1024,7 @@ impl CudaDevice {
             &k.ptr as *const u64 as *mut c_void,
             &v.ptr as *const u64 as *mut c_void,
             &pos.ptr as *const u64 as *mut c_void,
-            &(width as i32) as *const i32 as *mut c_void,
+            leak_i32(width as i32),
         ];
         unsafe {
             check(
@@ -965,7 +1038,7 @@ impl CudaDevice {
         let mut p: [*mut c_void; 3] = [
             &x.ptr as *const u64 as *mut c_void,
             &b.ptr as *const u64 as *mut c_void,
-            &(n as i32) as *const i32 as *mut c_void,
+            leak_i32(n as i32),
         ];
         unsafe {
             check(
@@ -980,7 +1053,7 @@ impl CudaDevice {
             &a.ptr as *const u64 as *mut c_void,
             &b.ptr as *const u64 as *mut c_void,
             &y.ptr as *const u64 as *mut c_void,
-            &(n as i32) as *const i32 as *mut c_void,
+            leak_i32(n as i32),
         ];
         unsafe {
             check(
@@ -1009,11 +1082,11 @@ impl CudaDevice {
             &vc.ptr as *const u64 as *mut c_void,
             &out.ptr as *const u64 as *mut c_void,
             &pos.ptr as *const u64 as *mut c_void,
-            &(n_heads as i32) as *const i32 as *mut c_void,
-            &(n_kv as i32) as *const i32 as *mut c_void,
-            &(hd as i32) as *const i32 as *mut c_void,
-            &(width as i32) as *const i32 as *mut c_void,
-            &(window as i32) as *const i32 as *mut c_void,
+            leak_i32(n_heads as i32),
+            leak_i32(n_kv as i32),
+            leak_i32(hd as i32),
+            leak_i32(width as i32),
+            leak_i32(window as i32),
         ];
         // 512 scores + max + sum slots
         let shared = (512 + 128 + 1) * 4;
@@ -1030,7 +1103,7 @@ impl CudaDevice {
             &gate.ptr as *const u64 as *mut c_void,
             &up.ptr as *const u64 as *mut c_void,
             &out.ptr as *const u64 as *mut c_void,
-            &(n as i32) as *const i32 as *mut c_void,
+            leak_i32(n as i32),
         ];
         unsafe {
             check(
@@ -1090,6 +1163,62 @@ impl CudaDevice {
             check(
                 (self.api.cu_launch)(self.api.f16_rows, (w.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
                 "launch f16 rows",
+            )
+        }
+    }
+
+    pub fn matvec_qkv_device(
+        &self,
+        wq: &QuantBuffer,
+        wk: &QuantBuffer,
+        wv: &QuantBuffer,
+        x: &CudaBuffer,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+    ) -> Result<()> {
+        let mut p: [*mut c_void; 10] = [
+            &wq.ptr as *const u64 as *mut c_void,
+            &wk.ptr as *const u64 as *mut c_void,
+            &wv.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &q.ptr as *const u64 as *mut c_void,
+            &k.ptr as *const u64 as *mut c_void,
+            &v.ptr as *const u64 as *mut c_void,
+            leak_i32(wq.rows as i32),
+            leak_i32(wk.rows as i32),
+            leak_i32(wq.cols as i32),
+        ];
+        let total = wq.rows + wk.rows + wv.rows;
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.qkv, (total as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch qkv",
+            )
+        }
+    }
+
+    pub fn matvec_gu_device(
+        &self,
+        wg: &QuantBuffer,
+        wu: &QuantBuffer,
+        x: &CudaBuffer,
+        g: &CudaBuffer,
+        u: &CudaBuffer,
+    ) -> Result<()> {
+        let mut p: [*mut c_void; 7] = [
+            &wg.ptr as *const u64 as *mut c_void,
+            &wu.ptr as *const u64 as *mut c_void,
+            &x.ptr as *const u64 as *mut c_void,
+            &g.ptr as *const u64 as *mut c_void,
+            &u.ptr as *const u64 as *mut c_void,
+            leak_i32(wg.rows as i32),
+            leak_i32(wg.cols as i32),
+        ];
+        unsafe {
+            check(
+                (self.api.cu_launch)(self.api.gu, (wg.rows as u32).div_ceil(8), 1, 1, 256, 1, 1, 0, self.api.stream, p.as_mut_ptr(), std::ptr::null_mut()),
+                "launch gu",
             )
         }
     }
@@ -1455,7 +1584,7 @@ impl CudaDevice {
                 &gate_ptr as *const u64 as *mut c_void,
                 &up_ptr as *const u64 as *mut c_void,
                 &act_ptr as *const u64 as *mut c_void,
-                &(ffn_len as i32) as *const i32 as *mut c_void,
+                leak_i32(ffn_len as i32),
             ];
             check(
                 (self.api.cu_launch)(
@@ -1491,6 +1620,14 @@ impl CudaDevice {
         entry.1 += 1;
         Ok(())
     }
+}
+
+fn leak_i32(v: i32) -> *mut c_void {
+    Box::into_raw(Box::new(v)) as *mut c_void
+}
+
+fn leak_f32(v: f32) -> *mut c_void {
+    Box::into_raw(Box::new(v)) as *mut c_void
 }
 
 fn check(code: i32, what: &str) -> Result<()> {
