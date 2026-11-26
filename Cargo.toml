@@ -1,11 +1,11 @@
 [package]
-name = "cortex"
+name = "cortex-llm"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "From-scratch Rust inference engine for LLaMA-style language models (GGUF, quantized weights, KV cache, BPE, sampling)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/cortex"
+repository = "https://github.com/0x00ef-team/cortex-llm"
 keywords = ["llm", "inference", "gguf", "transformer", "rust"]
 categories = ["science", "command-line-utilities"]
 

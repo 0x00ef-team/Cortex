@@ -6,7 +6,7 @@ project, where to put new code and what a good pull request looks like.
 ## Quick start
 
 ```bash
-git clone https://github.com/0x00ef-team/Cortex.git
+git clone https://github.com/0x00ef-team/cortex-llm.git
 cd Cortex
 cargo build --release
 cargo test
@@ -82,7 +82,7 @@ or Apache-2.0, at the project's option (see `LICENSE`).
 ### Быстрый старт
 
 ```bash
-git clone https://github.com/0x00ef-team/Cortex.git
+git clone https://github.com/0x00ef-team/cortex-llm.git
 cd Cortex
 cargo build --release
 cargo test
