@@ -175,7 +175,9 @@ Three math-identical fusions were added to the native forward path:
 q/k/v biases are applied inside `matvec_f16_qkv`, SwiGLU is computed inside
 `matvec_f16_gu` (no separate `gate`/`up`/activation pass), and the residual is
 added inside the `wo`/`down` matvec epilogues. These remove 6 kernel launches
-per layer. Output for 30 greedy tokens is byte-identical to the previous build.
+per layer. On Qwen2.5-0.5B Q4_K_M this moved throughput from 254.71 tok/s to
+274-276 tok/s (+8-9%, same binary/config otherwise). Output for 30 greedy
+tokens is byte-identical to the previous build.
 
 `CORTEX_CUDA_EVENTS=1` prints GPU-event timings per 16 tokens, e.g.
 `attn=0.73ms ffn=1.78ms head=0.86ms`. At batch=1 the FFN matvecs are
