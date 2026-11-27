@@ -43,6 +43,13 @@ pub mod ggml_type {
     pub const F64: u32 = 28;
     pub const IQ1_M: u32 = 29;
     pub const BF16: u32 = 30;
+    pub const TQ1_0: u32 = 34;
+    pub const TQ2_0: u32 = 35;
+    pub const Q1_0: u32 = 41;
+    pub const Q2_0: u32 = 42;
+    pub const PQ2_0: u32 = 142;
+    pub const PTQ1_0: u32 = 143;
+    pub const PQ2_0M: u32 = 145;
 }
 
 /// Number of bytes needed to store `elements` values of a given type.

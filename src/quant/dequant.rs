@@ -32,6 +32,13 @@ pub const fn block_bytes(kind: u32) -> usize {
         Q5_K => 176, // f16 d + f16 dmin + 12 scales + 32 qh + 128 qs
         Q6_K => 210, // 128 ql + 64 qh + 16 i8 scales + f16 d
         Q8_K => 292, // f32 d + 256 i8 + 16 i16 sums
+        Q1_0 => 18,  // f16 d + 16 bytes of 1-bit quants
+        Q2_0 => 18,  // f16 d + 16 bytes of 2-bit quants
+        TQ1_0 => 54, // 48 qs + 4 qh + f16 d (ternary, 1.6875 bpw)
+        TQ2_0 => 66, // 64 qs + f16 d (ternary, 2.0625 bpw)
+        PQ2_0 => 34,  // f16 d + 32 bytes of 2-bit quants (Prism, group 128)
+        PTQ1_0 => 28, // 24 qs + 2 qh + f16 d (Prism, group 128)
+        PQ2_0M => 36, // f16 d + f16 m + 32 qs (KV only)
         _ => 0,
     }
 }
@@ -73,6 +80,13 @@ pub fn type_name(kind: u32) -> &'static str {
         F64 => "F64",
         IQ1_M => "IQ1_M",
         BF16 => "BF16",
+        TQ1_0 => "TQ1_0",
+        TQ2_0 => "TQ2_0",
+        Q1_0 => "Q1_0",
+        Q2_0 => "Q2_0",
+        PQ2_0 => "PQ2_0",
+        PTQ1_0 => "PTQ1_0",
+        PQ2_0M => "PQ2_0M",
         _ => "UNKNOWN",
     }
 }
@@ -171,9 +185,147 @@ pub fn dequantize_row(kind: u32, src: &[u8], dst: &mut [f32], elements: usize) -
         Q4_K => dequant_q4_k(src, dst, elements),
         Q5_K => dequant_q5_k(src, dst, elements),
         Q6_K => dequant_q6_k(src, dst, elements),
+        Q1_0 => dequant_q1_0(src, dst, elements),
+        Q2_0 => dequant_q2_0(src, dst, elements),
+        TQ1_0 => dequant_tq1_0(src, dst, elements),
+        TQ2_0 => dequant_tq2_0(src, dst, elements),
+        PQ2_0 => dequant_pq2_0(src, dst, elements),
+        PQ2_0M => dequant_pq2_0m(src, dst, elements),
+        PTQ1_0 => dequant_ptq1_0(src, dst, elements),
         _ => return false,
     }
     true
+}
+
+/// Prism PQ2_0: same 2-bit codec as Q2_0 but with a 128-wide group.
+fn dequant_pq2_0(b: &[u8], y: &mut [f32], k: usize) {
+    for blk in 0..k / 128 {
+        let base = blk * 34;
+        let d = half_to_f32(u16le(b, base));
+        for j in 0..128 {
+            let q = (b[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[blk * 128 + j] = (q as i32 - 1) as f32 * d;
+        }
+    }
+}
+
+/// Prism PQ2_0M: `m + q * d`, used for KV-cache only.
+fn dequant_pq2_0m(b: &[u8], y: &mut [f32], k: usize) {
+    for blk in 0..k / 128 {
+        let base = blk * 36;
+        let d = half_to_f32(u16le(b, base));
+        let m = half_to_f32(u16le(b, base + 2));
+        for j in 0..128 {
+            let q = (b[base + 4 + j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[blk * 128 + j] = m + q as f32 * d;
+        }
+    }
+}
+
+/// Prism PTQ1_0: base-3 trit packing at group size 128 (24 qs + 2 qh + f16 d).
+fn dequant_ptq1_0(b: &[u8], y: &mut [f32], k: usize) {
+    const POW3: [u32; 6] = [1, 3, 9, 27, 81, 243];
+    for blk in 0..k / 128 {
+        let base = blk * 28;
+        let d = half_to_f32(u16le(b, base + 26));
+        let mut out = blk * 128;
+        let mut j = 0usize;
+        for c in [32usize, 16, 8] {
+            while j + c <= 24 {
+                for n in 0..5 {
+                    for m in 0..c {
+                        let q = b[base + j + m] as u32 * POW3[n];
+                        let xi = ((q * 3) >> 8) as i32;
+                        y[out] = (xi - 1) as f32 * d;
+                        out += 1;
+                    }
+                }
+                j += c;
+            }
+        }
+        for n in 0..4 {
+            for h in 0..2 {
+                let q = b[base + 24 + h] as u32 * POW3[n];
+                let xi = ((q * 3) >> 8) as i32;
+                y[out] = (xi - 1) as f32 * d;
+                out += 1;
+            }
+        }
+    }
+}
+
+/// Q1_0: one sign bit per weight with a shared f16 scale.
+fn dequant_q1_0(b: &[u8], y: &mut [f32], k: usize) {
+    for blk in 0..k / 128 {
+        let base = blk * 18;
+        let d = half_to_f32(u16le(b, base));
+        for j in 0..128 {
+            let bit = (b[base + 2 + j / 8] >> (j % 8)) & 1;
+            y[blk * 128 + j] = if bit != 0 { d } else { -d };
+        }
+    }
+}
+
+/// Q2_0: 2 bits per weight (`00=-1, 01=0, 10=+1, 11=+2`).
+fn dequant_q2_0(b: &[u8], y: &mut [f32], k: usize) {
+    for blk in 0..k / 64 {
+        let base = blk * 18;
+        let d = half_to_f32(u16le(b, base));
+        for j in 0..64 {
+            let q = (b[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[blk * 64 + j] = (q as i32 - 1) as f32 * d;
+        }
+    }
+}
+
+/// TQ1_0: ternary weights packed five per byte (3^5 codebook) plus a 2-bit
+/// tail. Layout: qs[48], qh[4], f16 d.
+fn dequant_tq1_0(b: &[u8], y: &mut [f32], k: usize) {
+    const POW3: [u32; 6] = [1, 3, 9, 27, 81, 243];
+    for blk in 0..k / 256 {
+        let base = blk * 54;
+        let d = half_to_f32(u16le(b, base + 52));
+        let mut out = blk * 256;
+        for j in (0..48).step_by(32) {
+            for n in 0..5 {
+                for m in 0..32 {
+                    let q = b[base + j + m] as u32 * POW3[n];
+                    let xi = ((q * 3) >> 8) as i32;
+                    y[out] = (xi - 1) as f32 * d;
+                    out += 1;
+                }
+            }
+        }
+        for j in 32..48 {
+            for n in 0..5 {
+                let q = b[base + j] as u32 * POW3[n];
+                let xi = ((q * 3) >> 8) as i32;
+                y[out] = (xi - 1) as f32 * d;
+                out += 1;
+            }
+        }
+        for n in 0..4 {
+            for j in 0..4 {
+                let q = b[base + 48 + j] as u32 * POW3[n];
+                let xi = ((q * 3) >> 8) as i32;
+                y[out] = (xi - 1) as f32 * d;
+                out += 1;
+            }
+        }
+    }
+}
+
+/// TQ2_0: 2-bit ternary codes, 64 weights per f16 scale.
+fn dequant_tq2_0(b: &[u8], y: &mut [f32], k: usize) {
+    for blk in 0..k / 256 {
+        let base = blk * 66;
+        let d = half_to_f32(u16le(b, base + 64));
+        for j in 0..64 {
+            let q = (b[base + j / 4] >> ((j % 4) * 2)) & 0x03;
+            let v = match q { 0 => 1.0f32, 1 => 2.0, 2 => 0.0, _ => -1.0 };
+            y[blk * 256 + j] = v * d;
+        }
+    }
 }
 
 fn dequant_q4_0(b: &[u8], y: &mut [f32], k: usize) {

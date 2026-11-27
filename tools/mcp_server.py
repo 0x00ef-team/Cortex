@@ -102,7 +102,14 @@ def tool_ggml_bench(args):
     context = int(args.get("context", 1024))
     cmd = [str(ROOT / "target/release/examples/ggml_bench"), model,
            args.get("prompt", "Once upon a time"), str(n), str(context)]
-    return run(cmd, timeout=1200)
+    env = os.environ.copy()
+    if args.get("dir"):
+        env["CORTEX_GGML_DIR"] = str(args["dir"])
+    if args.get("ngl") is not None:
+        env["CORTEX_GGML_NGL"] = str(int(args["ngl"]))
+    if args.get("chat"):
+        env["CORTEX_GGML_CHAT"] = "1"
+    return run(cmd, timeout=1200, env=env)
 
 
 TOOLS = {
@@ -119,7 +126,8 @@ TOOLS = {
     ),
     "cortex_ggml_bench": (
         "Benchmark decode throughput via llama.cpp CUDA FFI (opt-in backend).",
-        {"model": "string", "prompt": "string", "n": "integer", "context": "integer"},
+        {"model": "string", "prompt": "string", "n": "integer", "context": "integer",
+         "dir": "string", "ngl": "integer", "chat": "boolean"},
         tool_ggml_bench,
     ),
     "cortex_parity": (

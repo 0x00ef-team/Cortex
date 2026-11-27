@@ -13,6 +13,11 @@ fn main() -> Result<()> {
         Error::InvalidConfig("usage: ggml_generate <model.gguf> <prompt> <max_tokens>".into())
     })?;
     let prompt = args.get(1).cloned().unwrap_or_else(|| "Hello".into());
+    let prompt = if std::env::var_os("CORTEX_GGML_CHAT").is_some() {
+        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
+    } else {
+        prompt
+    };
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32);
     let mut m = GgmlCuda::load(path, 1024, 4)?;
     if std::env::var_os("GGML_DEBUG").is_some() {

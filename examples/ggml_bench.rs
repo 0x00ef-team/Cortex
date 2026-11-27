@@ -15,6 +15,11 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let path = args.first().ok_or_else(|| Error::InvalidConfig("usage: ggml_bench <model> <prompt> <n>".into()))?;
     let prompt = args.get(1).cloned().unwrap_or_else(|| "Once upon a time".into());
+    let prompt = if std::env::var_os("CORTEX_GGML_CHAT").is_some() {
+        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
+    } else {
+        prompt
+    };
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(64);
     let context: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1024);
     let t0 = Instant::now();

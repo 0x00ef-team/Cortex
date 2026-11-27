@@ -11,7 +11,10 @@ use std::path::Path;
 use std::time::Instant;
 
 #[repr(C, align(8))]
-struct ModelParams([u8; 80]);
+struct ModelParams80([u8; 80]);
+
+#[repr(C, align(8))]
+struct ModelParams88([u8; 88]);
 
 #[repr(C, align(8))]
 struct ContextParams([u8; 176]);
@@ -29,9 +32,11 @@ struct LlamaBatch {
 }
 
 type FnVoid = unsafe extern "C" fn();
-type FnModelParams = unsafe extern "C" fn() -> ModelParams;
+type FnModelParams80 = unsafe extern "C" fn() -> ModelParams80;
+type FnModelParams88 = unsafe extern "C" fn() -> ModelParams88;
 type FnCtxParams = unsafe extern "C" fn() -> ContextParams;
-type FnLoad = unsafe extern "C" fn(*const c_char, ModelParams) -> *mut c_void;
+type FnLoad80 = unsafe extern "C" fn(*const c_char, ModelParams80) -> *mut c_void;
+type FnLoad88 = unsafe extern "C" fn(*const c_char, ModelParams88) -> *mut c_void;
 type FnInit = unsafe extern "C" fn(*mut c_void, ContextParams) -> *mut c_void;
 type FnVoidPtr = unsafe extern "C" fn(*mut c_void);
 type FnPtrRet = unsafe extern "C" fn(*const c_void) -> *mut c_void;
@@ -74,9 +79,12 @@ unsafe fn sym<T: Copy>(h: *mut c_void, name: &str) -> Result<T> {
 struct Lib {
     _h: *mut c_void,
     _ggml: *mut c_void,
-    default_model: FnModelParams,
+    prism: bool,
+    default_model80: FnModelParams80,
+    default_model88: FnModelParams88,
     default_ctx: FnCtxParams,
-    load: FnLoad,
+    load80: FnLoad80,
+    load88: FnLoad88,
     init: FnInit,
     free: FnVoidPtr,
     model_free: FnVoidPtr,
@@ -99,23 +107,29 @@ impl Lib {
             .unwrap_or_else(|_| "/home/serjey/.unsloth/llama.cpp/build/bin".into());
         // Preload the dependencies by absolute path so dlopen can resolve
         // their SONAMEs without LD_LIBRARY_PATH being set at process start.
-        let cudart_dir = std::env::var("CORTEX_CUDART_DIR").unwrap_or_else(|_| {
-            "/home/serjey/.unsloth/studio/unsloth_studio/lib/python3.13/site-packages/nvidia/cu13/lib".into()
+        let prism = std::env::var("CORTEX_GGML_ABI").map(|v| v == "prism").unwrap_or_else(|_| {
+            Path::new(&dir).join("libllama.so.0").exists()
         });
         let mut paths: Vec<String> = Vec::new();
-        for name in ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"] {
-            paths.push(format!("{cudart_dir}/{name}"));
+        if !prism {
+            let cudart_dir = std::env::var("CORTEX_CUDART_DIR").unwrap_or_else(|_| {
+                "/home/serjey/.unsloth/studio/unsloth_studio/lib/python3.13/site-packages/nvidia/cu13/lib".into()
+            });
+            for name in ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"] {
+                paths.push(format!("{cudart_dir}/{name}"));
+            }
         }
+        let suffix = if prism { "0" } else { "1" };
         for name in [
-            "libggml-base.so.1",
-            "libggml.so.1",
-            "libggml-cuda.so",
-            "libllama.so.1",
+            format!("libggml-base.so.{suffix}"),
+            format!("libggml.so.{suffix}"),
+            "libggml-cuda.so".into(),
+            format!("libllama.so.{suffix}"),
         ] {
             paths.push(format!("{dir}/{name}"));
         }
         for path in paths {
-            let name = path.rsplit('/').next().unwrap_or(&path);
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
             let c = CString::new(path.clone()).unwrap();
             let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
             if h.is_null() {
@@ -128,12 +142,12 @@ impl Lib {
                 return Err(Error::InvalidConfig(format!("cannot load {path}: {msg}")));
             }
         }
-        let c = CString::new(format!("{dir}/libllama.so.1")).unwrap();
+        let c = CString::new(format!("{dir}/libllama.so.{suffix}")).unwrap();
         let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
         if h.is_null() {
             return Err(Error::InvalidConfig("cannot load libllama.so.1".into()));
         }
-        let c = CString::new(format!("{dir}/libggml.so.1")).unwrap();
+        let c = CString::new(format!("{dir}/libggml.so.{suffix}")).unwrap();
         let ggml = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
         if ggml.is_null() {
             return Err(Error::InvalidConfig("cannot load libggml.so.1".into()));
@@ -141,7 +155,10 @@ impl Lib {
         unsafe {
             let ggml_log_set: unsafe extern "C" fn(
                 Option<unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>, *mut c_void,
-            ) = sym(ggml, "ggml_log_set")?;
+            ) = match sym::<unsafe extern "C" fn(Option<unsafe extern "C" fn(c_int, *const c_char, *mut c_void)>, *mut c_void)>(ggml, "ggml_log_set") {
+                Ok(f) => f,
+                Err(_) => sym(ggml, "ggml_log_set")?,
+            };
             unsafe extern "C" fn quiet(_: c_int, _: *const c_char, _: *mut c_void) {}
             if std::env::var_os("CORTEX_GGML_LOG").is_none() {
                 ggml_log_set(Some(quiet), std::ptr::null_mut());
@@ -161,9 +178,12 @@ impl Lib {
             Ok(Self {
                 _h: h,
                 _ggml: ggml,
-                default_model: sym(h, "llama_model_default_params")?,
+                prism,
+                default_model80: sym(h, "llama_model_default_params")?,
+                default_model88: sym(h, "llama_model_default_params")?,
                 default_ctx: sym(h, "llama_context_default_params")?,
-                load: sym(h, "llama_model_load_from_file")?,
+                load80: sym(h, "llama_model_load_from_file")?,
+                load88: sym(h, "llama_model_load_from_file")?,
                 init: sym(h, "llama_init_from_model")?,
                 free: sym(h, "llama_free")?,
                 model_free: sym(h, "llama_model_free")?,
@@ -200,16 +220,22 @@ fn put_i32(buf: &mut [u8], off: usize, v: i32) {
 impl GgmlCuda {
     pub fn load(path: impl AsRef<Path>, context: usize, threads: i32) -> Result<Self> {
         let lib = Lib::open()?;
-        let mut mp = unsafe { (lib.default_model)() };
-        // n_gpu_layers at offset 16 (see mirrored header layout).
-        // -1 offloads everything; large models need a smaller value.
         let ngl = std::env::var("CORTEX_GGML_NGL")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(-1);
-        put_i32(&mut mp.0, 16, ngl);
         let path = CString::new(path.as_ref().to_string_lossy().as_bytes()).unwrap();
-        let model = unsafe { (lib.load)(path.as_ptr(), mp) };
+        let model = unsafe {
+            if lib.prism {
+                let mut mp = (lib.default_model88)();
+                put_i32(&mut mp.0, 24, ngl); // PrismML layout
+                (lib.load88)(path.as_ptr(), mp)
+            } else {
+                let mut mp = (lib.default_model80)();
+                put_i32(&mut mp.0, 16, ngl);
+                (lib.load80)(path.as_ptr(), mp)
+            }
+        };
         if model.is_null() {
             return Err(Error::InvalidConfig("llama_model_load_from_file failed".into()));
         }

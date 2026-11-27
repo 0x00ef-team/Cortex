@@ -119,6 +119,41 @@ The optional llama.cpp FFI backend reaches **308.68 tok/s** in one measured run
 (Minecraft using ~4 CPU cores and the GPU). This is not a stable, reproducible
 300+ result for the native engine; see `BENCHMARKS.md` for every data point.
 
+## Bonsai / Bonsai 2 support
+
+`prism-ml/Bonsai-27B` (Q1_0, `qwen35`) and `prism-ml/Ternary-Bonsai-2-*`
+(Q2_0, PQ2_0, PTQ1_0, `qwen35`/`dflash`) use ternary/Hadamard-rotated weights.
+The stock llama.cpp build rejects GGML types 142/143, so the **recommended
+path is the PrismML fork** of llama.cpp:
+
+```bash
+gh release download --repo PrismML-Eng/llama.cpp \
+  --pattern 'llama-prism-*-bin-linux-cuda-12.4-x64.tar.gz'
+tar -xzf llama-prism-*-cuda-12.4-x64.tar.gz -C /tmp/prism-bin --strip-components=1
+
+CORTEX_GGML_DIR=/tmp/prism-bin CORTEX_GGML_NGL=20 CORTEX_GGML_CHAT=1 \
+  ./target/release/examples/ggml_generate MODEL.gguf "Hello" 48
+```
+
+`CORTEX_GGML_CHAT=1` wraps the prompt in the Qwen chat template — required for
+sane answers from these instruct models. `CORTEX_GGML_NGL` controls GPU layers
+(27B models need partial offload on 8 GB VRAM). `CORTEX_GGML_ABI=prism` is
+auto-detected when the directory contains `libllama.so.0`; the FFI mirrors both
+the upstream (80-byte) and Prism (88-byte) `llama_model_params` layouts.
+
+Native dequant routines for Q1_0, Q2_0, TQ1_0, TQ2_0, PQ2_0, PTQ1_0 and PQ2_0M
+were added to `src/quant/`, so Cortex can read the tensors. Native generation
+is **not validated**: the Prism Hadamard input/inverse transforms are not
+implemented in our `qwen35` path, so use the FFI backend for real output.
+
+Measured with the Prism fork on this machine (RTX 2060 SUPER, heavy host load):
+
+| Model | Quant | Layers on GPU | tok/s |
+|---|---|---|---|
+| Bonsai-27B | Q1_0 | 24 | 1.84 |
+| Bonsai 2.5-27B | PTQ1_0 | 20 | 0.61 |
+| Bonsai 2-9B | PTQ1_0 | 24 | (coherent output, not benchmarked) |
+
 ## Optional llama.cpp CUDA FFI backend
 
 `src/ggml.rs` can load a prebuilt `libllama.so.1` at runtime (`dlopen`, no Rust
