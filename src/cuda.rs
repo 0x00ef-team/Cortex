@@ -53,6 +53,9 @@ type CuGraphLaunch = unsafe extern "C" fn(u64, u64) -> i32;
 type CuGraphGetNodes = unsafe extern "C" fn(u64, *mut u64, *mut usize) -> i32;
 type CuStreamSynchronize = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoDAsync = unsafe extern "C" fn(u64, *const c_void, usize, u64) -> i32;
+type CuEventCreate = unsafe extern "C" fn(*mut u64, u32) -> i32;
+type CuEventRecord = unsafe extern "C" fn(u64, u64) -> i32;
+type CuEventElapsed = unsafe extern "C" fn(*mut f32, u64, u64) -> i32;
 
 type NvrtcCreateProgram = unsafe extern "C" fn(
     *mut u64,
@@ -389,7 +392,7 @@ extern "C" __global__ void matvec_f32_rows(
 
 extern "C" extern "C" __global__ void matvec_f16_rows(
     const unsigned short* __restrict__ W, const float* __restrict__ x,
-    float* __restrict__ y, int rows, int cols)
+    float* __restrict__ y, const float* __restrict__ res, int rows, int cols)
 {
     int r = blockIdx.x * 8 + threadIdx.x / 32;
     if (r >= rows) return;
@@ -407,12 +410,13 @@ extern "C" extern "C" __global__ void matvec_f16_rows(
         sum += __half2float(__ushort_as_half(row[c])) * x[c];
     }
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
-    if (lane == 0) y[r] = sum;
+    if (lane == 0) y[r] = sum + (res ? res[r] : 0.f);
 }
 
 extern "C" __global__ void matvec_f16_qkv(
     const unsigned short* WQ, const unsigned short* WK, const unsigned short* WV,
     const float* x, float* q, float* k, float* v,
+    const float* BQ, const float* BK, const float* BV,
     int q_rows, int kv_rows, int cols)
 {
     int r = blockIdx.x * 8 + threadIdx.x / 32;
@@ -434,12 +438,19 @@ extern "C" __global__ void matvec_f16_qkv(
         sum += a.x * xa.x + a.y * xa.y + b.x * xb.x + b.y * xb.y;
     }
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
-    if (lane == 0) out[r < q_rows ? r : (r < q_rows + kv_rows ? r - q_rows : r - q_rows - kv_rows)] = sum;
+    if (lane == 0) {
+        int oi = r < q_rows ? r : (r < q_rows + kv_rows ? r - q_rows : r - q_rows - kv_rows);
+        float b = 0.f;
+        if (r < q_rows) { if (BQ) b = BQ[r]; }
+        else if (r < q_rows + kv_rows) { if (BK) b = BK[oi]; }
+        else if (BV) b = BV[oi];
+        out[oi] = sum + b;
+    }
 }
 
 extern "C" __global__ void matvec_f16_gu(
     const unsigned short* WG, const unsigned short* WU,
-    const float* x, float* g, float* u, int rows, int cols)
+    const float* x, float* out, int rows, int cols)
 {
     int r = blockIdx.x * 8 + threadIdx.x / 32;
     if (r >= rows) return;
@@ -461,7 +472,7 @@ extern "C" __global__ void matvec_f16_gu(
         sg += __shfl_down_sync(0xffffffffu, sg, off);
         su += __shfl_down_sync(0xffffffffu, su, off);
     }
-    if (lane == 0) { g[r] = sg; u[r] = su; }
+    if (lane == 0) out[r] = (sg / (1.f + expf(-sg))) * su;
 }
 
 extern "C" __global__ void cortex_rmsnorm(
@@ -728,6 +739,9 @@ struct Api {
     graph_inst: CuGraphInstantiate,
     graph_launch: CuGraphLaunch,
     graph_nodes: CuGraphGetNodes,
+    event_create: CuEventCreate,
+    event_record: CuEventRecord,
+    event_elapsed: CuEventElapsed,
     stream_sync: CuStreamSynchronize,
     memcpy_async: CuMemcpyHtoDAsync,
     cu_mem_alloc: CuMemAlloc,
@@ -796,6 +810,9 @@ impl CudaDevice {
             let cu_graph_inst: CuGraphInstantiate = ffi!(cuda, "cuGraphInstantiate_v2", CuGraphInstantiate);
             let cu_graph_launch: CuGraphLaunch = ffi!(cuda, "cuGraphLaunch", CuGraphLaunch);
             let cu_graph_nodes: CuGraphGetNodes = ffi!(cuda, "cuGraphGetNodes", CuGraphGetNodes);
+            let cu_event_create: CuEventCreate = ffi!(cuda, "cuEventCreate", CuEventCreate);
+            let cu_event_record: CuEventRecord = ffi!(cuda, "cuEventRecord", CuEventRecord);
+            let cu_event_elapsed: CuEventElapsed = ffi!(cuda, "cuEventElapsedTime", CuEventElapsed);
             let cu_stream_sync: CuStreamSynchronize = ffi!(cuda, "cuStreamSynchronize", CuStreamSynchronize);
             let cu_memcpy_async: CuMemcpyHtoDAsync = ffi!(cuda, "cuMemcpyHtoDAsync_v2", CuMemcpyHtoDAsync);
 
@@ -947,6 +964,9 @@ impl CudaDevice {
                     graph_inst: cu_graph_inst,
                     graph_launch: cu_graph_launch,
                     graph_nodes: cu_graph_nodes,
+                    event_create: cu_event_create,
+                    event_record: cu_event_record,
+                    event_elapsed: cu_event_elapsed,
                     stream_sync: cu_stream_sync,
                     memcpy_async: cu_memcpy_async,
                     cu_mem_alloc,
@@ -1039,6 +1059,27 @@ impl CudaDevice {
                 "cuMemcpyHtoDAsync(bytes)",
             )
         }
+    }
+
+    pub fn new_event(&self) -> Result<u64> {
+        let mut e = 0u64;
+        unsafe { check((self.api.event_create)(&mut e, 0), "cuEventCreate")?; }
+        Ok(e)
+    }
+
+    pub fn record_event(&self, event: u64) -> Result<()> {
+        unsafe {
+            check(
+                (self.api.event_record)(event, self.api.active_stream.get()),
+                "cuEventRecord",
+            )
+        }
+    }
+
+    pub fn elapsed_ms(&self, a: u64, b: u64) -> Result<f32> {
+        let mut ms = 0f32;
+        unsafe { check((self.api.event_elapsed)(&mut ms, a, b), "cuEventElapsedTime")?; }
+        Ok(ms)
     }
 
     pub fn argmax_device(&self, x: &CudaBuffer, out: &CudaBuffer, n: usize) -> Result<()> {
@@ -1311,12 +1352,20 @@ impl CudaDevice {
     /// Launch the f32 matvec kernel without synchronizing (uses `matvec_f32`).
     /// Coalesced block-per-row f32 matvec (for the very tall output head).
     pub fn matvec_f16_rows_device(&self, w: &QuantBuffer, x: &CudaBuffer, y: &CudaBuffer) -> Result<()> {
+        self.matvec_f16_rows_res_device(w, x, y, None)
+    }
+
+    pub fn matvec_f16_rows_res_device(
+        &self, w: &QuantBuffer, x: &CudaBuffer, y: &CudaBuffer, res: Option<&CudaBuffer>,
+    ) -> Result<()> {
         let r = w.rows as i32;
         let c = w.cols as i32;
-        let mut p: [*mut c_void; 5] = [
+        let zero: u64 = 0;
+        let mut p: [*mut c_void; 6] = [
             &w.ptr as *const u64 as *mut c_void,
             &x.ptr as *const u64 as *mut c_void,
             &y.ptr as *const u64 as *mut c_void,
+            match res { Some(b) => &b.ptr as *const u64 as *mut c_void, None => &zero as *const u64 as *mut c_void },
             &r as *const i32 as *mut c_void,
             &c as *const i32 as *mut c_void,
         ];
@@ -1337,8 +1386,12 @@ impl CudaDevice {
         q: &CudaBuffer,
         k: &CudaBuffer,
         v: &CudaBuffer,
+        bq: Option<&CudaBuffer>,
+        bk: Option<&CudaBuffer>,
+        bv: Option<&CudaBuffer>,
     ) -> Result<()> {
-        let mut p: [*mut c_void; 10] = [
+        let zero: u64 = 0;
+        let mut p: [*mut c_void; 13] = [
             &wq.ptr as *const u64 as *mut c_void,
             &wk.ptr as *const u64 as *mut c_void,
             &wv.ptr as *const u64 as *mut c_void,
@@ -1346,6 +1399,9 @@ impl CudaDevice {
             &q.ptr as *const u64 as *mut c_void,
             &k.ptr as *const u64 as *mut c_void,
             &v.ptr as *const u64 as *mut c_void,
+            match bq { Some(b) => &b.ptr as *const u64 as *mut c_void, None => &zero as *const u64 as *mut c_void },
+            match bk { Some(b) => &b.ptr as *const u64 as *mut c_void, None => &zero as *const u64 as *mut c_void },
+            match bv { Some(b) => &b.ptr as *const u64 as *mut c_void, None => &zero as *const u64 as *mut c_void },
             leak_i32(wq.rows as i32),
             leak_i32(wk.rows as i32),
             leak_i32(wq.cols as i32),
@@ -1364,15 +1420,13 @@ impl CudaDevice {
         wg: &QuantBuffer,
         wu: &QuantBuffer,
         x: &CudaBuffer,
-        g: &CudaBuffer,
-        u: &CudaBuffer,
+        out: &CudaBuffer,
     ) -> Result<()> {
-        let mut p: [*mut c_void; 7] = [
+        let mut p: [*mut c_void; 6] = [
             &wg.ptr as *const u64 as *mut c_void,
             &wu.ptr as *const u64 as *mut c_void,
             &x.ptr as *const u64 as *mut c_void,
-            &g.ptr as *const u64 as *mut c_void,
-            &u.ptr as *const u64 as *mut c_void,
+            &out.ptr as *const u64 as *mut c_void,
             leak_i32(wg.rows as i32),
             leak_i32(wg.cols as i32),
         ];

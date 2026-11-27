@@ -121,6 +121,11 @@ pub(crate) struct LlamaGpu {
     cos_table: Vec<f32>,
     sin_table: Vec<f32>,
     half: usize,
+    profile: Option<Profile>,
+}
+
+struct Profile {
+    events: Vec<u64>,
 }
 
 impl LlamaGpu {
@@ -191,6 +196,15 @@ impl LlamaGpu {
         let sin = dev.alloc(half)?;
         let pos_dev = dev.alloc(1)?;
         let dev_clone = Arc::clone(&dev);
+        let profile = if std::env::var_os("CORTEX_CUDA_EVENTS").is_some() {
+            let mut events = Vec::with_capacity(2 * cfg.n_layers + 2);
+            for _ in 0..(2 * cfg.n_layers + 2) {
+                events.push(dev.new_event()?);
+            }
+            Some(Profile { events })
+        } else {
+            None
+        };
         Ok(Self {
             dev,
             layers,
@@ -223,13 +237,25 @@ impl LlamaGpu {
             cos_table,
             sin_table,
             half,
+            profile,
         })
     }
 
     fn mv(&self, q: &QuantBuffer, x: &CudaBuffer, y: &CudaBuffer) -> Result<()> {
+        self.mv_res(q, x, y, None)
+    }
+
+    /// Matvec with an optional residual added in the epilogue (saves a launch).
+    fn mv_res(
+        &self, q: &QuantBuffer, x: &CudaBuffer, y: &CudaBuffer, res: Option<&CudaBuffer>,
+    ) -> Result<()> {
         if q.kind == 1 {
-            self.dev.matvec_f16_rows_device(q, x, y)
+            self.dev.matvec_f16_rows_res_device(q, x, y, res)
         } else {
+            if res.is_some() {
+                self.dev.matvec_q_device(q, x, y)?;
+                return Err(Error::InvalidConfig("residual fusion requires f16 weights".into()));
+            }
             self.dev.matvec_q_device(q, x, y)
         }
     }
@@ -291,6 +317,9 @@ impl LlamaGpu {
         self.dev.copy_to_device_async(&self.cos, &self.cos_table[pos * self.half..(pos + 1) * self.half])?;
         self.dev.copy_to_device_async(&self.sin, &self.sin_table[pos * self.half..(pos + 1) * self.half])?;
         self.dev.copy_bytes_to_device_async(&self.pos_dev, &(pos as i32).to_le_bytes())?;
+        if self.profile.is_some() && !graph_mode {
+            self.dev.record_event(self.profile.as_ref().unwrap().events[0])?;
+        }
         if capture {
             self.dev.sync()?;
             self.dev.activate_graph_stream();
@@ -307,20 +336,15 @@ impl LlamaGpu {
         let mut cur = &self.x;
         let mut next = &self.x2;
         for (li, layer) in self.layers.iter().enumerate() {
+            if let Some(p) = &self.profile {
+                self.dev.record_event(p.events[2 * li])?;
+            }
             self.dev.rmsnorm_device(cur, &layer.attn_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
             self.dev.matvec_qkv_device(
                 &layer.wq, &layer.wk, &layer.wv,
                 &self.xb, &self.q, &self.k, &self.v,
+                layer.bq.as_ref(), layer.bk.as_ref(), layer.bv.as_ref(),
             )?;
-            if let Some(b) = &layer.bq {
-                self.dev.add_bias_device(&self.q, b, self.n_heads * self.hd)?;
-            }
-            if let Some(b) = &layer.bk {
-                self.dev.add_bias_device(&self.k, b, self.width)?;
-            }
-            if let Some(b) = &layer.bv {
-                self.dev.add_bias_device(&self.v, b, self.width)?;
-            }
             self.dev.rope_device(
                 &self.q, &self.k, &self.cos, &self.sin,
                 self.n_heads, self.n_kv, self.hd,
@@ -333,26 +357,32 @@ impl LlamaGpu {
                 &self.pos_dev, self.n_heads, self.n_kv, self.hd, self.width,
                 0,
             )?;
-            self.mv(&layer.wo, &self.attn, &self.o)?;
-            self.dev.add_device(cur, &self.o, next, self.n_embd)?;
+            self.mv_res(&layer.wo, &self.attn, next, Some(cur))?;
             std::mem::swap(&mut cur, &mut next);
+            if let Some(p) = &self.profile {
+                self.dev.record_event(p.events[2 * li + 1])?;
+            }
 
             self.dev.rmsnorm_device(cur, &layer.ffn_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
             self.dev.matvec_gu_device(
-                &layer.gate, &layer.up, &self.xb, &self.gate, &self.up,
+                &layer.gate, &layer.up, &self.xb, &self.act,
             )?;
-            self.dev.swiglu_device(&self.gate, &self.up, &self.act, self.n_ffn)?;
-            self.mv(&layer.down, &self.act, &self.down)?;
-            self.dev.add_device(cur, &self.down, next, self.n_embd)?;
+            self.mv_res(&layer.down, &self.act, next, Some(cur))?;
             std::mem::swap(&mut cur, &mut next);
             let _ = li;
         }
 
         let t_layer = t_start.elapsed();
+        if let Some(p) = &self.profile {
+            self.dev.record_event(p.events[2 * self.layers.len()])?;
+        }
         self.dev.rmsnorm_device(cur, &self.final_norm, &self.xb, self.n_embd, cfg.rms_eps)?;
         self.mv_out(&self.xb, &self.logits, cfg.vocab_size, self.n_embd)?;
         if argmax {
             self.dev.argmax_device(&self.logits, &self.argmax_out, cfg.vocab_size)?;
+        }
+        if let Some(p) = &self.profile {
+            self.dev.record_event(p.events[2 * self.layers.len() + 1])?;
         }
         let t_head = t_start.elapsed();
         if capture {
@@ -373,6 +403,20 @@ impl LlamaGpu {
         let t_all = t_start.elapsed();
         if std::env::var_os("CORTEX_GPU_PROFILE").is_some() {
             eprintln!("[gpu-profile] layers={:?} total={:?}", t_layer, t_all);
+        }
+        if let Some(p) = &self.profile {
+            let n = self.layers.len();
+            let mut attn = 0f32;
+            let mut ffn = 0f32;
+            for i in 0..n {
+                attn += self.dev.elapsed_ms(p.events[2 * i], p.events[2 * i + 1])?;
+                ffn += self.dev.elapsed_ms(p.events[2 * i + 1], p.events[2 * i + 2])?;
+            }
+            let head = self.dev.elapsed_ms(p.events[2 * n], p.events[2 * n + 1])?;
+            if self.calls % 16 == 0 {
+                eprintln!("[events] attn={:.3}ms ffn={:.3}ms head={:.3}ms total={:.3}ms",
+                    attn, ffn, head, attn + ffn + head);
+            }
         }
         Ok(())
     }

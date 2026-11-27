@@ -169,6 +169,20 @@ then diverges at a near-tie argmax: llama.cpp uses its own KV-cache precision
 and kernel accumulation order. Treat this backend as a different numerical
 implementation, not as a bit-identical extension of the native engine.
 
+## CUDA launch fusions and profiling
+
+Three math-identical fusions were added to the native forward path:
+q/k/v biases are applied inside `matvec_f16_qkv`, SwiGLU is computed inside
+`matvec_f16_gu` (no separate `gate`/`up`/activation pass), and the residual is
+added inside the `wo`/`down` matvec epilogues. These remove 6 kernel launches
+per layer. Output for 30 greedy tokens is byte-identical to the previous build.
+
+`CORTEX_CUDA_EVENTS=1` prints GPU-event timings per 16 tokens, e.g.
+`attn=0.73ms ffn=1.78ms head=0.86ms`. At batch=1 the FFN matvecs are
+bandwidth-bound (~74% of HBM peak); attention is now mostly launch-overhead.
+Further gains require fewer bytes read (quantized weights) rather than more
+fusion.
+
 ## Optional paths (opt-in)
 
 ```bash
