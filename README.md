@@ -290,6 +290,19 @@ llama.cpp (`examples/ggml_bench`, замер только decode). Повтор�
 AVX-векторизация `dot`, SIMD-ядра для Q8_0/Q5_0/Q4_K/Q6_K, деквантовка блоками
 в L1-буфер и постоянный пул потоков.
 
+## Подмодуль для обучения
+
+`crates/cortex-train` — git submodule:универсальный фреймворк для создания и обучения
+нейросетей с нуля на Rust (autograd, модули, AdamW). Клонируйте с:
+
+```bash
+git clone --recursive https://github.com/0x00ef-team/cortex-llm.git
+# или в уже склонированном репозитории:
+git submodule update --init --recursive
+```
+
+Подробности — в [`crates/cortex-train/README.md`](crates/cortex-train/README.md).
+
 ### Тесты без модели
 
 Модуль `cortex::synthetic` генерирует крошечный валидный GGUF (2 слоя, dim 16,
